@@ -1,4 +1,4 @@
-|"""
+"""
 relaxPlayer - Reproductor Multimedia Nativo (Android y PC)
 Fluidez total (60 FPS), fondo 100% opaco sin transparencias al subir,
 audio nativo compatible con Flet 1.1+ y control de volumen en vivo al deslizar.
