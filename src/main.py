@@ -1,16 +1,15 @@
-"""
+|"""
 relaxPlayer - Reproductor Multimedia Nativo (Android y PC)
-Fluidez total (60 FPS), escaneo automatico sin conectar carpetas, cero emojis.
+Fluidez total (60 FPS), fondo 100% opaco sin transparencias al subir,
+audio nativo compatible con Flet 1.1+ y control de volumen en vivo al deslizar.
 
-Instalacion:
-    pip install flet flet-audio flet-video mutagen
-
-Ejecutar:
-    python relax_player.py
+Dependencias (pyproject.toml):
+    flet, flet-audio, flet-video, flet-permission-handler, mutagen
 """
 
 import asyncio
 import base64
+import dataclasses
 import datetime
 import inspect
 import json
@@ -67,7 +66,7 @@ except Exception:
     PermHandler = None
     PermType = None
 
-# Lector de portadas y datos solo bajo demanda (para la pista que suena)
+# Lector de portadas y metadatos bajo demanda
 MUTAGEN_OK = False
 try:
     from mutagen import File as MutagenFile
@@ -117,7 +116,11 @@ IGNORED_DIR_NAMES = {
 
 
 def es_entorno_android() -> bool:
-    return os.path.isdir(ANDROID_ROOT)
+    return (
+        os.path.isdir(ANDROID_ROOT)
+        or "ANDROID_ROOT" in os.environ
+        or "ANDROID_DATA" in os.environ
+    )
 
 
 def es_uri_android(ruta: str) -> bool:
@@ -129,6 +132,19 @@ def hex_con_opacidad(hex_color: str, alpha_hex: str) -> str:
     return f"#{alpha_hex}{clean}"
 
 
+def mezclar_color_solido(hex_acento: str, hex_fondo: str, peso_acento: float = 0.28) -> str:
+    """Mezcla dos colores y devuelve un hex 100% opaco (sin transparencia) para el fondo del reproductor."""
+    c1 = hex_acento.lstrip("#")
+    c2 = hex_fondo.lstrip("#")
+    r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
+    r2, g2, b2 = int(c2[0:2], 16), int(c2[2:4], 16), int(c2[4:6], 16)
+    p = max(0.0, min(1.0, peso_acento))
+    r = int(round(r1 * p + r2 * (1.0 - p)))
+    g = int(round(g1 * p + g2 * (1.0 - p)))
+    b = int(round(b1 * p + b2 * (1.0 - p)))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def formatear_tiempo(segundos: float) -> str:
     segundos = max(0, int(segundos))
     mins, secs = divmod(segundos, 60)
@@ -136,6 +152,49 @@ def formatear_tiempo(segundos: float) -> str:
     if hrs > 0:
         return f"{hrs}:{mins:02d}:{secs:02d}"
     return f"{mins}:{secs:02d}"
+
+
+def obtener_parametros_clase(cls) -> set:
+    """Detecta los argumentos validos de una clase de Flet (compatible con 0.x y 1.x)."""
+    nombres = set()
+    if cls is None:
+        return nombres
+    try:
+        if dataclasses.is_dataclass(cls):
+            for f in dataclasses.fields(cls):
+                nombres.add(f.name)
+    except Exception:
+        pass
+    try:
+        sig = inspect.signature(cls.__init__)
+        for k, param in sig.parameters.items():
+            if k != "self" and param.kind not in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                nombres.add(k)
+    except Exception:
+        pass
+    return nombres
+
+
+def extraer_segundos_evento(val) -> float:
+    """Convierte Duration, timedelta, int/float (ms) o string a segundos reales."""
+    if val is None:
+        return -1.0
+    try:
+        if hasattr(val, "in_milliseconds"):
+            return float(val.in_milliseconds) / 1000.0
+        if hasattr(val, "total_seconds"):
+            return float(val.total_seconds())
+        if isinstance(val, (int, float)):
+            return float(val) / 1000.0
+        s = str(val).strip()
+        if s:
+            return float(s) / 1000.0
+    except Exception:
+        pass
+    return -1.0
 
 
 def cargar_logo_local_b64() -> str:
@@ -264,7 +323,7 @@ def envolver_safe_area(control):
     return control
 
 
-# --- Escaneo ultrarrapido (NO abre archivos al escanear -> tarda milisegundos) ---
+# --- Escaneo ultrarrapido ---
 _COVER_CACHE = {}
 
 
@@ -302,7 +361,7 @@ def crear_info_instantanea(ruta: str, nombre_opcional: str = "", mtime: float = 
 
 
 def leer_detalles_pista_actual(track: dict) -> tuple:
-    """Lee portada, artista y duracion SOLO de la pista que acabas de tocar."""
+    """Lee portada, artista y duracion SOLO de la pista actual."""
     ruta = track["path"]
     if track["is_video"] or es_uri_android(ruta) or not MUTAGEN_OK or not os.path.isfile(ruta):
         return "", track["title"], track["artist"], track["duration"]
@@ -352,17 +411,30 @@ def leer_detalles_pista_actual(track: dict) -> tuple:
 
 
 def obtener_raices_escaneo_automatico() -> list:
-    """Detecta automaticamente donde guarda musica y videos el dispositivo (cero configuracion manual)."""
     raices = []
     if es_entorno_android():
-        raices.append(ANDROID_ROOT)
-        # Incluir tarjetas SD externas si existen
+        directas = [
+            "/storage/emulated/0/Music",
+            "/storage/emulated/0/Download",
+            "/storage/emulated/0/Movies",
+            "/storage/emulated/0/DCIM",
+            "/storage/emulated/0/Snaptube",
+            "/storage/emulated/0/Audio",
+            "/storage/emulated/0/Podcasts",
+            "/storage/emulated/0/Recordings",
+            "/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Audio",
+            "/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video",
+            ANDROID_ROOT,
+        ]
+        for c in directas:
+            if os.path.isdir(c) and c not in raices:
+                raices.append(c)
         try:
             if os.path.isdir("/storage"):
                 for entry in os.listdir("/storage"):
                     if entry not in ("emulated", "self"):
                         sd = os.path.join("/storage", entry)
-                        if os.path.isdir(sd):
+                        if os.path.isdir(sd) and sd not in raices:
                             raices.append(sd)
         except Exception:
             pass
@@ -392,44 +464,33 @@ def obtener_raices_escaneo_automatico() -> list:
 
 
 def escanear_todo_el_dispositivo(manual_items: list) -> list:
-    """Recorre rapido el almacenamiento y separa musica y videos automaticamente."""
     encontrados = []
     vistos = set()
 
     for raiz in obtener_raices_escaneo_automatico():
-        # En Android escanear tambien WhatsApp Media dentro de Android/media
-        rutas_extra_wa = []
-        if raiz == ANDROID_ROOT:
-            wa_media = os.path.join(ANDROID_ROOT, "Android", "media")
-            if os.path.isdir(wa_media):
-                rutas_extra_wa.append(wa_media)
+        try:
+            for root, dirs, files in os.walk(raiz):
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d.lower() not in IGNORED_DIR_NAMES
+                ]
+                for fname in files:
+                    if fname.startswith("."):
+                        continue
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in ALL_MEDIA_EXTS:
+                        full = os.path.join(root, fname)
+                        norm = os.path.normcase(full)
+                        if norm not in vistos:
+                            vistos.add(norm)
+                            try:
+                                mt = os.path.getmtime(full)
+                            except Exception:
+                                mt = 0.0
+                            encontrados.append(crear_info_instantanea(full, mtime=mt))
+        except PermissionError:
+            pass
 
-        for carpeta_base in [raiz] + rutas_extra_wa:
-            try:
-                for root, dirs, files in os.walk(carpeta_base):
-                    # Limitar profundidad y evitar carpetas pesadas del sistema
-                    dirs[:] = [
-                        d for d in dirs
-                        if not d.startswith(".") and d.lower() not in IGNORED_DIR_NAMES
-                    ]
-                    for fname in files:
-                        if fname.startswith("."):
-                            continue
-                        ext = os.path.splitext(fname)[1].lower()
-                        if ext in ALL_MEDIA_EXTS:
-                            full = os.path.join(root, fname)
-                            norm = os.path.normcase(full)
-                            if norm not in vistos:
-                                vistos.add(norm)
-                                try:
-                                    mt = os.path.getmtime(full)
-                                except Exception:
-                                    mt = 0.0
-                                encontrados.append(crear_info_instantanea(full, mtime=mt))
-            except PermissionError:
-                pass
-
-    # Incluir archivos importados manualmente si alguno estaba en otra unidad
     for item in manual_items or []:
         ruta = item.get("path", "")
         if not ruta:
@@ -491,6 +552,7 @@ def main(page: ft.Page):
     datos = cargar_datos()
     logo_b64 = cargar_logo_local_b64()
     en_android = es_entorno_android()
+    audio_params = obtener_parametros_clase(FletAudio)
 
     page.title = "relaxPlayer"
     page.padding = 0
@@ -526,12 +588,16 @@ def main(page: ft.Page):
         "active_playlist": None,
         "player_open": False,
         "anim_token": 0,
+        "audio_token": 0,
+        "audio_started": False,
         "is_playing": False,
+        "seeking": False,
         "position": 0.0,
         "duration": 0.0,
         "shuffle": False,
         "repeat": False,
         "volume": float(datos.get("volume", 0.85)),
+        "last_vol_push": 0.0,
         "speed": 1.0,
         "sleep_remaining": 0,
         "active_tab": 0,         # 0: Musica, 1: Videos, 2: Privado, 3: Ajustes
@@ -541,6 +607,7 @@ def main(page: ft.Page):
         "scanning": False,
         "last_pos_ui": 0.0,
         "search_token": 0,
+        "last_audio_error": "",
     }
 
     def ancho_pantalla() -> float:
@@ -597,7 +664,7 @@ def main(page: ft.Page):
     )
 
     def avisar(texto: str):
-        estado["status_until"] = time.time() + 3.0
+        estado["status_until"] = time.time() + 3.2
         p = paleta()
         banner_aviso.bgcolor = p["surface_alt"]
         banner_texto.color = p["text"]
@@ -652,12 +719,15 @@ def main(page: ft.Page):
     async def pedir_permisos_android():
         if perm_handler is None or PermType is None:
             return
-        for nombre_perm in ("AUDIO", "VIDEOS", "STORAGE", "MANAGE_EXTERNAL_STORAGE"):
+        for nombre_perm in ("MANAGE_EXTERNAL_STORAGE", "AUDIO", "VIDEOS", "STORAGE"):
             perm = getattr(PermType, nombre_perm, None)
             if perm is not None:
-                await llamar_seguro(perm_handler, "request_permission", perm)
+                if hasattr(perm_handler, "request"):
+                    await llamar_seguro(perm_handler, "request", perm)
+                else:
+                    await llamar_seguro(perm_handler, "request_permission", perm)
 
-    # --- Escaneo automatico total al abrir (sin carpetas que conectar) ---
+    # --- Escaneo automatico ---
     async def escanear_async(mostrar_aviso: bool = True):
         if estado["scanning"]:
             return
@@ -724,11 +794,30 @@ def main(page: ft.Page):
             dlg.open = False
             page.update()
 
-    # --- Audio nativo + progreso sin lag ---
+    # --- Motor de audio nativo compatible con Flet 1.x y 0.x ---
     audio_service = {"ctrl": None}
     video_widget_ref = {"ctrl": None}
 
-    slider_progreso = ft.Slider(min=0, max=100, value=0, on_change_end=lambda e: saltar_a_segundo(e.control.value))
+    def _al_arrastrar_progreso(e):
+        estado["seeking"] = True
+        try:
+            pos = float(e.control.value or 0.0)
+            txt_tiempo_actual.value = formatear_tiempo(pos)
+            actualizar_control(txt_tiempo_actual)
+        except Exception:
+            pass
+
+    def _al_soltar_progreso(e):
+        estado["seeking"] = False
+        saltar_a_segundo(float(e.control.value or 0.0))
+
+    slider_progreso = ft.Slider(
+        min=0,
+        max=100,
+        value=0,
+        on_change=_al_arrastrar_progreso,
+        on_change_end=_al_soltar_progreso,
+    )
     txt_tiempo_actual = ft.Text("0:00", size=11, font_family="PoppinsSemi")
     txt_tiempo_total = ft.Text("0:00", size=11, font_family="PoppinsSemi")
     contenedor_progreso = ft.Column(
@@ -737,6 +826,59 @@ def main(page: ft.Page):
             slider_progreso,
             ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[txt_tiempo_actual, txt_tiempo_total]),
         ],
+    )
+
+    # Controles persistentes de volumen en vivo (sin esperar a soltar la barra)
+    txt_volumen_pct = ft.Text(f"{int(round(estado['volume'] * 100))}%", size=11, font_family="PoppinsSemi", width=36, text_align=ft.TextAlign.RIGHT)
+
+    def _aplicar_volumen_en_motores(val: float, forzar: bool = False):
+        ahora = time.time()
+        if not forzar and (ahora - estado["last_vol_push"] < 0.035):
+            return
+        estado["last_vol_push"] = ahora
+
+        ctrl = audio_service["ctrl"]
+        if ctrl is not None:
+            try:
+                ctrl.volume = val
+                ctrl.update()
+            except Exception:
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+        vw = video_widget_ref["ctrl"]
+        if vw is not None:
+            try:
+                vw.volume = val * 100.0
+                vw.update()
+            except Exception:
+                pass
+
+    def cambiar_volumen_en_vivo(e):
+        val = max(0.0, min(1.0, float(e.control.value)))
+        estado["volume"] = val
+        txt_volumen_pct.value = f"{int(round(val * 100))}%"
+        actualizar_control(txt_volumen_pct)
+        _aplicar_volumen_en_motores(val, forzar=False)
+
+    def finalizar_volumen(e):
+        val = max(0.0, min(1.0, float(e.control.value)))
+        estado["volume"] = val
+        txt_volumen_pct.value = f"{int(round(val * 100))}%"
+        actualizar_control(txt_volumen_pct)
+        _aplicar_volumen_en_motores(val, forzar=True)
+        datos["volume"] = val
+        threading.Thread(target=guardar_datos, args=(dict(datos),), daemon=True).start()
+
+    slider_volumen = ft.Slider(
+        min=0.0,
+        max=1.0,
+        value=estado["volume"],
+        expand=True,
+        on_change=cambiar_volumen_en_vivo,
+        on_change_end=finalizar_volumen,
     )
 
     txt_timer_badge = ft.Text("", size=11, font_family="PoppinsSemi")
@@ -749,6 +891,8 @@ def main(page: ft.Page):
     )
 
     def actualizar_solo_progreso():
+        if estado["seeking"]:
+            return
         try:
             dur = float(estado["duration"] or 0.0)
             pos = max(0.0, float(estado["position"] or 0.0))
@@ -766,92 +910,158 @@ def main(page: ft.Page):
         val = getattr(e, "position", None)
         if val is None:
             val = getattr(e, "data", None)
-        try:
-            if val is not None:
-                estado["position"] = (val.in_milliseconds / 1000.0) if hasattr(val, "in_milliseconds") else (float(val) / 1000.0)
-                ahora = time.time()
-                if estado["player_open"] and (ahora - estado["last_pos_ui"] >= 0.75):
-                    estado["last_pos_ui"] = ahora
-                    actualizar_solo_progreso()
-        except Exception:
-            pass
+        seg = extraer_segundos_evento(val)
+        if seg >= 0.0:
+            estado["position"] = seg
+            if seg > 0.05:
+                estado["audio_started"] = True
+            ahora = time.time()
+            if estado["player_open"] and not estado["seeking"] and (ahora - estado["last_pos_ui"] >= 0.45):
+                estado["last_pos_ui"] = ahora
+                actualizar_solo_progreso()
 
     def _on_audio_dur(e):
         val = getattr(e, "duration", None)
         if val is None:
             val = getattr(e, "data", None)
-        try:
-            if val is not None:
-                estado["duration"] = (val.in_milliseconds / 1000.0) if hasattr(val, "in_milliseconds") else (float(val) / 1000.0)
-                if estado["player_open"]:
-                    actualizar_solo_progreso()
-        except Exception:
-            pass
+        seg = extraer_segundos_evento(val)
+        if seg > 0.0:
+            estado["duration"] = seg
+            if estado["player_open"]:
+                actualizar_solo_progreso()
 
     def _on_audio_state(e):
         st = str(getattr(e, "state", None) or getattr(e, "data", "")).lower()
-        if "completed" in st:
+        if "playing" in st:
+            estado["audio_started"] = True
+            estado["is_playing"] = True
+        elif "completed" in st:
             siguiente_pista()
 
-    async def _reproducir_audio_async(track: dict):
+    def _on_audio_loaded(e):
+        if estado["is_playing"] and not estado["audio_started"] and audio_service["ctrl"] is not None:
+            ejecutar_async(llamar_seguro, audio_service["ctrl"], "play")
+
+    def construir_control_audio(ruta: str):
+        """Instancia flet_audio.Audio adaptandose automaticamente a Flet 1.x (on_*_change) y 0.x (on_*_changed)."""
         if FletAudio is None:
-            avisar("Instala flet-audio en tu PC: pip install flet-audio")
+            return None
+
+        kw = {"src": ruta}
+        if not audio_params or "autoplay" in audio_params:
+            kw["autoplay"] = True
+        if not audio_params or "volume" in audio_params:
+            kw["volume"] = estado["volume"]
+        if not audio_params or "playback_rate" in audio_params:
+            kw["playback_rate"] = estado["speed"]
+
+        # Detectar nombre exacto de eventos en esta version instalada de flet-audio
+        if "on_position_change" in audio_params:
+            kw["on_position_change"] = _on_audio_pos
+        elif "on_position_changed" in audio_params:
+            kw["on_position_changed"] = _on_audio_pos
+
+        if "on_duration_change" in audio_params:
+            kw["on_duration_change"] = _on_audio_dur
+        elif "on_duration_changed" in audio_params:
+            kw["on_duration_changed"] = _on_audio_dur
+
+        if "on_state_change" in audio_params:
+            kw["on_state_change"] = _on_audio_state
+        elif "on_state_changed" in audio_params:
+            kw["on_state_changed"] = _on_audio_state
+
+        if "on_loaded" in audio_params:
+            kw["on_loaded"] = _on_audio_loaded
+
+        try:
+            return FletAudio(**kw)
+        except TypeError:
+            # Respaldo minimo garantizado sin argumentos opcionales
+            return FletAudio(src=ruta, autoplay=True, volume=estado["volume"])
+
+    async def _buscar_posicion_segura(ctrl, ms: int):
+        ms_int = max(0, int(ms))
+        dur_cls = getattr(ft, "Duration", None)
+        if dur_cls is not None:
+            try:
+                res = ctrl.seek(dur_cls(milliseconds=ms_int))
+                if inspect.isawaitable(res):
+                    await res
+                return
+            except TypeError:
+                pass
+            except Exception as ex:
+                print("[relaxPlayer] seek(Duration) fallo:", ex)
+        await llamar_seguro(ctrl, "seek", ms_int)
+
+    async def _reproducir_audio_async(track: dict, tok: int):
+        if FletAudio is None:
+            estado["last_audio_error"] = "flet-audio no disponible"
+            avisar("Motor de audio no instalado (flet-audio).")
             estado["is_playing"] = False
             refrescar_reproductor_y_mini()
             return
 
-        # Leer portada y metadatos de esta sola cancion en segundo plano (sin congelar la animacion)
-        cover_b64, _, _, _ = await asyncio.to_thread(leer_detalles_pista_actual, track)
-        if estado["current_track"] and estado["current_track"]["path"] == track["path"]:
+        try:
+            # Leer portada y metadatos de esta cancion en paralelo sin trabar la UI
+            cover_b64, _, _, _ = await asyncio.to_thread(leer_detalles_pista_actual, track)
+            if estado["audio_token"] != tok:
+                return
             estado["current_cover_b64"] = cover_b64
             if track.get("duration", 0) > 0:
                 estado["duration"] = track["duration"]
 
-        if audio_service["ctrl"] is not None:
-            await llamar_seguro(audio_service["ctrl"], "pause")
-            await llamar_seguro(audio_service["ctrl"], "release")
-            try:
-                if hasattr(page, "services") and audio_service["ctrl"] in page.services:
-                    page.services.remove(audio_service["ctrl"])
-                elif audio_service["ctrl"] in page.overlay:
-                    page.overlay.remove(audio_service["ctrl"])
-            except Exception:
-                pass
+            # Limpiar servicio anterior
+            if audio_service["ctrl"] is not None:
+                viejo = audio_service["ctrl"]
+                audio_service["ctrl"] = None
+                await llamar_seguro(viejo, "pause")
+                await llamar_seguro(viejo, "release")
+                try:
+                    if hasattr(page, "services") and viejo in page.services:
+                        page.services.remove(viejo)
+                    elif hasattr(page, "overlay") and viejo in page.overlay:
+                        page.overlay.remove(viejo)
+                except Exception:
+                    pass
 
-        try:
-            nuevo = FletAudio(
-                src=track["path"],
-                autoplay=True,
-                volume=estado["volume"],
-                playback_rate=estado["speed"],
-                on_position_changed=_on_audio_pos,
-                on_duration_changed=_on_audio_dur,
-                on_state_changed=_on_audio_state,
-            )
-        except TypeError:
-            nuevo = FletAudio(
-                src=track["path"],
-                autoplay=True,
-                volume=estado["volume"],
-                on_position_changed=_on_audio_pos,
-                on_duration_changed=_on_audio_dur,
-                on_state_changed=_on_audio_state,
-            )
+            estado["audio_started"] = False
+            estado["last_audio_error"] = ""
 
-        audio_service["ctrl"] = nuevo
-        registrar_servicio(nuevo)
-        page.update()
-        await asyncio.sleep(0.05)
-        await llamar_seguro(nuevo, "play")
-        estado["is_playing"] = True
-        refrescar_reproductor_y_mini()
+            nuevo = construir_control_audio(track["path"])
+            if nuevo is None:
+                avisar("No se pudo crear el reproductor de audio.")
+                return
+
+            audio_service["ctrl"] = nuevo
+            registrar_servicio(nuevo)
+            refrescar_reproductor_y_mini()
+            page.update()
+
+            # Esperar a que Flutter monte el servicio y arrancar si autoplay no inicio solo
+            await asyncio.sleep(0.22)
+            if estado["audio_token"] != tok or audio_service["ctrl"] is not nuevo:
+                return
+            if estado["is_playing"] and not estado["audio_started"]:
+                await llamar_seguro(nuevo, "play")
+        except Exception as ex:
+            estado["last_audio_error"] = str(ex)
+            estado["is_playing"] = False
+            print("[relaxPlayer] Error al reproducir audio:", ex)
+            avisar(f"Error de audio: {str(ex)[:90]}")
+            refrescar_reproductor_y_mini()
 
     def reproducir_pista(track: dict, abrir_pantalla: bool = True):
         privadas = set(datos.get("private_paths", []))
+        estado["audio_token"] += 1
+        tok = estado["audio_token"]
         estado["current_track"] = track
         estado["current_from_private"] = track["path"] in privadas
         estado["position"] = 0.0
         estado["duration"] = track.get("duration") or 0.0
+        estado["seeking"] = False
+        estado["audio_started"] = False
         estado["current_cover_b64"] = _COVER_CACHE.get(track["path"], "") if not track["is_video"] else ""
 
         datos["stats"]["plays"] = datos["stats"].get("plays", 0) + 1
@@ -872,7 +1082,7 @@ def main(page: ft.Page):
             abrir_reproductor_animado()
         else:
             refrescar_reproductor_y_mini()
-        ejecutar_async(_reproducir_audio_async, track)
+        ejecutar_async(_reproducir_audio_async, track, tok)
 
     def alternar_play_pausa(e=None):
         track = estado["current_track"]
@@ -902,7 +1112,10 @@ def main(page: ft.Page):
             ejecutar_async(llamar_seguro, ctrl, "pause")
             estado["is_playing"] = False
         else:
-            ejecutar_async(llamar_seguro, ctrl, "resume")
+            if estado["audio_started"] or estado["position"] > 0:
+                ejecutar_async(llamar_seguro, ctrl, "resume")
+            else:
+                ejecutar_async(llamar_seguro, ctrl, "play")
             estado["is_playing"] = True
         refrescar_reproductor_y_mini()
 
@@ -910,10 +1123,11 @@ def main(page: ft.Page):
         track = estado["current_track"]
         if track is None or track["is_video"]:
             return
-        segundo = max(0.0, min(segundo, estado["duration"] or 1.0))
+        dur_lim = estado["duration"] if estado["duration"] > 0 else max(segundo, 1.0)
+        segundo = max(0.0, min(segundo, dur_lim))
         estado["position"] = segundo
         if audio_service["ctrl"] is not None:
-            ejecutar_async(llamar_seguro, audio_service["ctrl"], "seek", int(segundo * 1000))
+            ejecutar_async(_buscar_posicion_segura, audio_service["ctrl"], int(segundo * 1000))
         actualizar_solo_progreso()
 
     def cola_actual_para_pista(track: dict):
@@ -957,26 +1171,6 @@ def main(page: ft.Page):
         rutas = [t["path"] for t in lista]
         idx = (rutas.index(track["path"]) - 1) % len(lista) if track["path"] in rutas else 0
         reproducir_pista(lista[idx], abrir_pantalla=estado["player_open"])
-
-    def cambiar_volumen(e):
-        val = max(0.0, min(1.0, float(e.control.value)))
-        estado["volume"] = val
-        if audio_service["ctrl"] is not None:
-            try:
-                audio_service["ctrl"].volume = val
-                audio_service["ctrl"].update()
-            except Exception:
-                pass
-        if video_widget_ref["ctrl"] is not None:
-            try:
-                video_widget_ref["ctrl"].volume = val * 100.0
-                video_widget_ref["ctrl"].update()
-            except Exception:
-                pass
-
-    def guardar_volumen_final(e):
-        datos["volume"] = estado["volume"]
-        threading.Thread(target=guardar_datos, args=(dict(datos),), daemon=True).start()
 
     def cambiar_velocidad(nueva_vel: float):
         estado["speed"] = float(nueva_vel)
@@ -1153,8 +1347,16 @@ def main(page: ft.Page):
                     txt_timer_badge.value = formatear_tiempo(estado["sleep_remaining"])
                     actualizar_control(row_timer_badge)
 
-    # --- Logo relaxPlayer ---
+    # --- Logo relaxPlayer (soporta base64 local y assets/logo.png dentro del APK) ---
     def widget_logo(p: dict, tam: int = 38):
+        fallback_ico = ft.Container(
+            width=tam,
+            height=tam,
+            border_radius=tam // 2,
+            bgcolor=hex_con_opacidad(p["accent"], "28"),
+            alignment=ft.Alignment(0, 0),
+            content=ft.Icon(Icons.HEADPHONES_ROUNDED, color=p["accent"], size=int(tam * 0.56)),
+        )
         if logo_b64:
             return ft.Container(
                 width=tam,
@@ -1164,14 +1366,24 @@ def main(page: ft.Page):
                 padding=2,
                 content=crear_imagen_b64(logo_b64, tam - 4, tam - 4, (tam - 4) // 2, fit=FIT_CONTAIN),
             )
-        return ft.Container(
-            width=tam,
-            height=tam,
-            border_radius=tam // 2,
-            bgcolor=hex_con_opacidad(p["accent"], "28"),
-            alignment=ft.Alignment(0, 0),
-            content=ft.Icon(Icons.HEADPHONES_ROUNDED, color=p["accent"], size=int(tam * 0.56)),
-        )
+        try:
+            return ft.Container(
+                width=tam,
+                height=tam,
+                border_radius=tam // 2,
+                bgcolor="#FFFFFF",
+                padding=2,
+                content=ft.Image(
+                    src="logo.png",
+                    width=tam - 4,
+                    height=tam - 4,
+                    fit=FIT_CONTAIN,
+                    border_radius=(tam - 4) // 2,
+                    error_content=fallback_ico,
+                ),
+            )
+        except Exception:
+            return fallback_ico
 
     def envolver_ancho_movil(contenido):
         w = ancho_pantalla()
@@ -1183,7 +1395,7 @@ def main(page: ft.Page):
             )
         return ft.Container(expand=True, content=contenido)
 
-    # --- Buscador con debounce de 250ms (escribes fluido sin trabas) ---
+    # --- Buscador con debounce ---
     async def _aplicar_busqueda_debounce(tok: int):
         await asyncio.sleep(0.25)
         if estado["search_token"] != tok:
@@ -1296,7 +1508,7 @@ def main(page: ft.Page):
         except Exception:
             return zona
 
-    # --- Vista Reproductor de MUSICA (sin sombras pesadas = animacion a 60 FPS) ---
+    # --- Vista Reproductor de MUSICA (100% opaco: cero transparencia hacia la lista) ---
     def vista_reproductor_musica(p: dict):
         track = estado["current_track"]
         titulo = track["title"] if track else "relaxPlayer"
@@ -1305,6 +1517,16 @@ def main(page: ft.Page):
         w = min(ancho_pantalla(), 480.0)
         h = alto_pantalla()
         cover_size = int(max(180, min(310, w * 0.72, h * 0.35)))
+
+        fallback_portada = ft.Container(
+            width=cover_size,
+            height=cover_size,
+            border_radius=22,
+            bgcolor=p["surface_alt"],
+            border=borde_todos(1, hex_con_opacidad(p["accent"], "44")),
+            alignment=ft.Alignment(0, 0),
+            content=ft.Icon(Icons.HEADPHONES_ROUNDED, size=int(cover_size * 0.36), color=p["accent"]),
+        )
 
         if estado.get("current_cover_b64"):
             contenido_portada = crear_imagen_b64(estado["current_cover_b64"], cover_size, cover_size, 22)
@@ -1320,15 +1542,26 @@ def main(page: ft.Page):
                 content=crear_imagen_b64(logo_b64, cover_size - pad_logo * 2, cover_size - pad_logo * 2, 16, fit=FIT_CONTAIN),
             )
         else:
-            contenido_portada = ft.Container(
-                width=cover_size,
-                height=cover_size,
-                border_radius=22,
-                bgcolor=p["surface_alt"],
-                border=borde_todos(1, hex_con_opacidad(p["accent"], "44")),
-                alignment=ft.Alignment(0, 0),
-                content=ft.Icon(Icons.HEADPHONES_ROUNDED, size=int(cover_size * 0.36), color=p["accent"]),
-            )
+            pad_logo = max(14, int(cover_size * 0.08))
+            try:
+                contenido_portada = ft.Container(
+                    width=cover_size,
+                    height=cover_size,
+                    border_radius=22,
+                    bgcolor="#FFFFFF",
+                    padding=pad_logo,
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Image(
+                        src="logo.png",
+                        width=cover_size - pad_logo * 2,
+                        height=cover_size - pad_logo * 2,
+                        fit=FIT_CONTAIN,
+                        border_radius=16,
+                        error_content=fallback_portada,
+                    ),
+                )
+            except Exception:
+                contenido_portada = fallback_portada
 
         slider_progreso.active_color = p["accent"]
         slider_progreso.inactive_color = p["border"]
@@ -1337,6 +1570,13 @@ def main(page: ft.Page):
         txt_tiempo_total.color = p["subtext"]
         txt_timer_badge.color = p["accent"]
         row_timer_badge.controls[0].color = p["accent"]
+
+        slider_volumen.active_color = p["accent"]
+        slider_volumen.inactive_color = p["border"]
+        slider_volumen.thumb_color = p["accent"]
+        slider_volumen.value = estado["volume"]
+        txt_volumen_pct.color = p["subtext"]
+        txt_volumen_pct.value = f"{int(round(estado['volume'] * 100))}%"
 
         dur = float(estado["duration"] or 0.0)
         pos = max(0.0, float(estado["position"] or 0.0))
@@ -1347,6 +1587,7 @@ def main(page: ft.Page):
         txt_tiempo_total.value = formatear_tiempo(dur)
 
         fav_activo = bool(track and es_favorito(track["path"]))
+        color_arriba_solido = mezclar_color_solido(p["accent"], p["bg"], 0.28)
 
         cuerpo = ft.Column(
             expand=True,
@@ -1428,10 +1669,10 @@ def main(page: ft.Page):
                 ft.Row(
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    spacing=8,
+                    spacing=6,
                     controls=[
                         ft.Container(
-                            padding=ft.Padding(11, 6, 11, 6),
+                            padding=ft.Padding(10, 6, 10, 6),
                             border_radius=14,
                             bgcolor=p["surface_alt"],
                             border=borde_todos(1, p["border"]),
@@ -1448,14 +1689,11 @@ def main(page: ft.Page):
                         ft.Row(
                             expand=True,
                             spacing=2,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             controls=[
                                 ft.Icon(Icons.VOLUME_DOWN_ROUNDED, size=18, color=p["subtext"]),
-                                ft.Slider(
-                                    min=0, max=1, value=estado["volume"], expand=True,
-                                    active_color=p["accent"], inactive_color=p["border"],
-                                    on_change=cambiar_volumen, on_change_end=guardar_volumen_final,
-                                ),
-                                ft.Icon(Icons.VOLUME_UP_ROUNDED, size=18, color=p["subtext"]),
+                                slider_volumen,
+                                txt_volumen_pct,
                             ],
                         ),
                     ],
@@ -1465,11 +1703,12 @@ def main(page: ft.Page):
 
         return ft.Container(
             expand=True,
+            bgcolor=p["bg"],
             padding=ft.Padding(18, 8, 18, 12),
             gradient=ft.LinearGradient(
                 begin=ft.Alignment(0, -1),
                 end=ft.Alignment(0, 0.72),
-                colors=[hex_con_opacidad(p["accent"], "38"), p["bg"]],
+                colors=[color_arriba_solido, p["bg"]],
             ),
             content=envolver_ancho_movil(cuerpo),
         )
@@ -1481,14 +1720,17 @@ def main(page: ft.Page):
 
         if FletVideo is not None and FletVideoMedia is not None and track:
             try:
-                vid = FletVideo(
-                    expand=True,
-                    playlist=[FletVideoMedia(track["path"])],
-                    autoplay=True,
-                    volume=estado["volume"] * 100.0,
-                    show_controls=True,
-                    fill_color="#000000",
-                )
+                vid_params = obtener_parametros_clase(FletVideo)
+                v_kw = {
+                    "expand": True,
+                    "playlist": [FletVideoMedia(track["path"])],
+                    "autoplay": True,
+                    "volume": estado["volume"] * 100.0,
+                    "show_controls": True,
+                }
+                if not vid_params or "fill_color" in vid_params:
+                    v_kw["fill_color"] = "#000000"
+                vid = FletVideo(**v_kw)
                 video_widget_ref["ctrl"] = vid
                 escenario = ft.Container(expand=True, border_radius=16, bgcolor="#000000", content=vid)
             except Exception as ex:
@@ -1516,10 +1758,17 @@ def main(page: ft.Page):
                     controls=[
                         ft.Icon(Icons.SMART_DISPLAY_ROUNDED, size=54, color=p["accent"]),
                         ft.Text("Activa el video integrado", size=16, font_family="PoppinsSemi", color=p["text"]),
-                        ft.Text("Instala flet-video (pip install flet-video) para reproducir videos aquí dentro.", size=12, color=p["subtext"], text_align=ft.TextAlign.CENTER),
+                        ft.Text("Instala flet-video para reproducir videos aquí dentro.", size=12, color=p["subtext"], text_align=ft.TextAlign.CENTER),
                     ],
                 ),
             )
+
+        slider_volumen.active_color = p["accent"]
+        slider_volumen.inactive_color = p["border"]
+        slider_volumen.thumb_color = p["accent"]
+        slider_volumen.value = estado["volume"]
+        txt_volumen_pct.color = p["subtext"]
+        txt_volumen_pct.value = f"{int(round(estado['volume'] * 100))}%"
 
         cuerpo = ft.Column(
             expand=True,
@@ -1555,12 +1804,21 @@ def main(page: ft.Page):
                         ft.IconButton(icon=Icons.SKIP_NEXT_ROUNDED, icon_size=32, icon_color=p["text"], on_click=siguiente_pista),
                     ],
                 ),
+                ft.Row(
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=4,
+                    controls=[
+                        ft.Icon(Icons.VOLUME_DOWN_ROUNDED, size=18, color=p["subtext"]),
+                        slider_volumen,
+                        txt_volumen_pct,
+                    ],
+                ),
             ],
         )
 
         return ft.Container(expand=True, bgcolor=p["bg"], padding=ft.Padding(14, 10, 14, 12), content=envolver_ancho_movil(cuerpo))
 
-    # --- Llenado paginado y ultraligero (max 35 filas a la vez = 0 lag incluso con 1000 canciones!) ---
+    # --- Llenado paginado y ultraligero ---
     def poblar_filas_media(p: dict, es_video: bool):
         clave_filtro = "video_filter" if es_video else "music_filter"
         clave_busq = "video_search" if es_video else "music_search"
@@ -1929,7 +2187,7 @@ def main(page: ft.Page):
         )
         return ft.Container(expand=True, bgcolor=p["bg"], padding=ft.Padding(16, 12, 16, 6), content=envolver_ancho_movil(cuerpo))
 
-    # --- Ajustes (limpio, sin pedir carpetas) ---
+    # --- Ajustes ---
     def vista_ajustes(p: dict):
         diarios = datos["stats"].get("daily_seconds", {})
         max_seg = max([60] + [diarios.get(d, 0) for d in DIAS_SEMANA])
@@ -2005,6 +2263,11 @@ def main(page: ft.Page):
                             ft.Text("Color principal", size=12, color=p["subtext"]),
                             ft.Row(spacing=12, controls=colores_ui),
                             ft.Text(f"Audio: {'Listo' if FletAudio else 'Falta flet-audio'} / Video: {'Listo' if FletVideo else 'Falta flet-video'}", size=11, color=p["subtext"]),
+                            *(
+                                [ft.Text(f"Último aviso audio: {estado['last_audio_error']}", size=10, color=p["accent"])]
+                                if estado["last_audio_error"]
+                                else []
+                            ),
                         ],
                     ),
                 ),
@@ -2083,11 +2346,12 @@ def main(page: ft.Page):
             ),
         )
 
-    # --- Capas optimizadas (solo GPU offset en capa_reproductor -> 60 FPS reales) ---
-    capa_lista = ft.Container(left=0, top=0, right=0, bottom=0)
+    # --- Capas solidas: al subir el reproductor tapa 100% la lista y la oculta al terminar ---
+    capa_lista = ft.Container(left=0, top=0, right=0, bottom=0, visible=True)
 
     capa_reproductor = crear_contenedor_animado(
         left=0, top=0, right=0, bottom=0,
+        bgcolor="#0B0B0F",
         visible=False,
         offset=crear_offset(0, 1.0),
         animate_offset=crear_animacion(280, "EASE_OUT_CUBIC"),
@@ -2116,6 +2380,7 @@ def main(page: ft.Page):
     def _montar_capa_reproductor(p: dict):
         if estado["current_track"] is None:
             return
+        capa_reproductor.bgcolor = p["bg"]
         if estado["current_track"]["is_video"]:
             capa_reproductor.content = vista_reproductor_video(p)
         else:
@@ -2137,7 +2402,7 @@ def main(page: ft.Page):
         if estado["player_open"] and estado["current_track"] is not None:
             _montar_capa_reproductor(p)
             actualizar_control(capa_reproductor)
-        if estado["active_tab"] in (0, 1):
+        if estado["active_tab"] in (0, 1) and capa_lista.visible:
             poblar_filas_media(p, es_video=(estado["active_tab"] == 1))
             actualizar_control(listview_media)
 
@@ -2164,6 +2429,12 @@ def main(page: ft.Page):
                 return
             capa_reproductor.offset = crear_offset(0, 0.0)
             actualizar_control(capa_reproductor)
+            # Al terminar de subir, ocultar por completo la capa de atras
+            await asyncio.sleep(0.30)
+            if estado["anim_token"] != tok or not estado["player_open"]:
+                return
+            capa_lista.visible = False
+            actualizar_control(capa_lista)
 
         ejecutar_async(_subir)
 
@@ -2173,14 +2444,20 @@ def main(page: ft.Page):
             ejecutar_async(llamar_seguro, video_widget_ref["ctrl"], "pause")
             estado["is_playing"] = False
         if not estado["player_open"] and not capa_reproductor.visible:
+            capa_lista.visible = True
             refrescar_vista_base()
             return
         estado["anim_token"] += 1
         tok = estado["anim_token"]
         estado["player_open"] = False
 
+        # Mostrar de nuevo la lista actualizada justo antes de deslizar hacia abajo
+        if estado["active_tab"] in (0, 1):
+            poblar_filas_media(p, es_video=(estado["active_tab"] == 1))
         contenedor_mini_barra.content = construir_mini_barra(p)
-        actualizar_control(contenedor_mini_barra)
+        capa_lista.visible = True
+        actualizar_control(capa_lista)
+
         capa_reproductor.offset = crear_offset(0, 1.0)
         actualizar_control(capa_reproductor)
 
@@ -2198,7 +2475,7 @@ def main(page: ft.Page):
     except Exception:
         pass
 
-    # Arranca al instante y escanea todo el dispositivo automaticamente en segundo plano
+    # Arranque instantaneo + escaneo automatico en segundo plano
     refrescar_vista_base()
     ejecutar_async(escanear_async, False)
     ejecutar_async(bucle_reloj)
