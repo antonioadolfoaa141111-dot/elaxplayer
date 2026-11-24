@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
 
 late final RelaxAudioHandler _audioHandler;
 
@@ -92,6 +93,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
   Future<void> Function()? onSkipPrevious;
   Future<void> Function()? onTrackCompleted;
   Future<void> Function()? onCrossfadeTrigger;
+  Future<void> Function()? onPreloadNext;
   Future<void> Function()? onHeadphonesDisconnected;
 
   bool autoPauseOnDisconnect = true;
@@ -100,6 +102,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
   double _baseVolume = 0.85;
   bool _repeatOne = false;
   bool _completionSent = false;
+  bool _preloadSent = false;
   bool _crossfading = false;
   bool _resumeAfterInterruption = false;
   int _fadeToken = 0;
@@ -125,18 +128,22 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       if (_usingA != isA) return;
       _posController.add(pos);
 
-      // Disparar transicion suave (Crossfade) cuando faltan X segundos para terminar
-      if (crossfadeSeconds > 0 && !_repeatOne && !_crossfading && p.playing) {
-        final dur = p.duration;
-        if (dur != null &&
+      // Pre-cargar siguiente pista en linea unos segundos antes para que el crossfade entre limpio
+      final dur = p.duration;
+      if (dur != null && dur.inSeconds > 16 && pos.inSeconds >= 3 && !_repeatOne && p.playing) {
+        final remaining = dur - pos;
+        if (!_preloadSent && remaining <= Duration(seconds: max(12, crossfadeSeconds + 10))) {
+          _preloadSent = true;
+          onPreloadNext?.call();
+        }
+        // Disparar transicion suave (Crossfade) cuando faltan X segundos para terminar
+        if (crossfadeSeconds > 0 &&
+            !_crossfading &&
             dur.inSeconds > crossfadeSeconds + 4 &&
-            pos.inSeconds >= 3) {
-          final remaining = dur - pos;
-          if (remaining <= Duration(seconds: crossfadeSeconds) &&
-              remaining > const Duration(milliseconds: 350)) {
-            _crossfading = true;
-            onCrossfadeTrigger?.call();
-          }
+            remaining <= Duration(seconds: crossfadeSeconds) &&
+            remaining > const Duration(milliseconds: 350)) {
+          _crossfading = true;
+          onCrossfadeTrigger?.call();
         }
       }
     });
@@ -248,6 +255,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
   Future<void> playMediaTrack({
     required String path,
+    String? sourceUrl,
     required String title,
     required String artist,
     required String album,
@@ -262,6 +270,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     _baseVolume = volume.clamp(0.0, 1.0);
     _repeatOne = repeatOne;
     _completionSent = false;
+    _preloadSent = false;
     _currentQueueIndex = queueIndex.clamp(0, max(0, queueItems.length - 1));
 
     final currentItem = MediaItem(
@@ -271,6 +280,13 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       album: album,
       artUri: artUri,
     );
+
+    Future<Duration?> loadInto(AudioPlayer target) {
+      if (sourceUrl != null && sourceUrl.isNotEmpty) {
+        return target.setUrl(sourceUrl);
+      }
+      return target.setFilePath(path);
+    }
 
     if (queueItems.isNotEmpty) {
       queue.add(queueItems);
@@ -286,7 +302,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       _fadeTimer?.cancel();
 
       try {
-        final dur = await incoming.setFilePath(path);
+        final dur = await loadInto(incoming);
         if (dur != null && dur > Duration.zero) {
           mediaItem.add(currentItem.copyWith(duration: dur));
         }
@@ -333,7 +349,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     // Cambio manual instantaneo
     _cancelCrossfade(stopStandby: true);
     final active = player;
-    final dur = await active.setFilePath(path);
+    final dur = await loadInto(active);
     if (dur != null && dur > Duration.zero) {
       mediaItem.add(currentItem.copyWith(duration: dur));
     }
@@ -472,6 +488,16 @@ const Map<String, List<double>> kEqPresets = {
 };
 
 const List<double> kSpeedOptions = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+const List<String> kOnlineQuickGenres = [
+  'Lofi Chill',
+  'Urbano',
+  'Reggaetón',
+  'Pop',
+  'Rock',
+  'Electrónica',
+  'Acústico',
+  'Salsa',
+];
 const List<String> kWeekDays = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];
 
 const Set<String> kIgnoredDirs = {
@@ -730,6 +756,10 @@ class MediaTrack {
   final int modifiedMs;
   String? coverPath;
   bool metadataLoaded;
+  final bool isOnline;
+  final String? onlineVideoId;
+  final String? remoteArtUrl;
+  final int? durationMs;
 
   MediaTrack({
     required this.path,
@@ -741,6 +771,10 @@ class MediaTrack {
     required this.modifiedMs,
     this.coverPath,
     this.metadataLoaded = false,
+    this.isOnline = false,
+    this.onlineVideoId,
+    this.remoteArtUrl,
+    this.durationMs,
   });
 
   Map<String, dynamic> toJson() => {
@@ -753,6 +787,10 @@ class MediaTrack {
         'modifiedMs': modifiedMs,
         'coverPath': coverPath,
         'metadataLoaded': metadataLoaded,
+        'isOnline': isOnline,
+        'onlineVideoId': onlineVideoId,
+        'remoteArtUrl': remoteArtUrl,
+        'durationMs': durationMs,
       };
 
   factory MediaTrack.fromJson(Map<String, dynamic> json) => MediaTrack(
@@ -765,6 +803,10 @@ class MediaTrack {
         modifiedMs: (json['modifiedMs'] as num?)?.toInt() ?? 0,
         coverPath: json['coverPath']?.toString(),
         metadataLoaded: json['metadataLoaded'] == true,
+        isOnline: json['isOnline'] == true,
+        onlineVideoId: json['onlineVideoId']?.toString(),
+        remoteArtUrl: json['remoteArtUrl']?.toString(),
+        durationMs: (json['durationMs'] as num?)?.toInt(),
       );
 }
 
@@ -992,7 +1034,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   late final AnimationController _sheetController;
   late final AnimationController _vinylController;
+  final yt.YoutubeExplode _ytClient = yt.YoutubeExplode();
   final TextEditingController _musicSearchCtrl = TextEditingController();
+  final TextEditingController _onlineSearchCtrl = TextEditingController();
   final TextEditingController _videoSearchCtrl = TextEditingController();
   final TextEditingController _pinCtrl = TextEditingController();
   final TextEditingController _newPinCtrl = TextEditingController();
@@ -1002,6 +1046,17 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   List<MediaTrack> _activeAudioQueue = [];
   List<MediaTrack> _activeVideoQueue = [];
 
+  // Buscador de musica en linea + cache de streams
+  List<MediaTrack> _onlineResults = [];
+  List<String> _recentOnlineSearches = [];
+  Map<String, MediaTrack> _savedOnlineTracks = {};
+  final Map<String, String> _streamUrlCache = {};
+  final Map<String, int> _streamUrlExpMs = {};
+  bool _searchingOnline = false;
+  bool _loadingOnlineTrack = false;
+  String? _onlineError;
+  int _playRequestToken = 0;
+
   MediaTrack? _currentTrack;
   bool _isPlaying = false;
   bool _scanning = false;
@@ -1010,7 +1065,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   String _cacheDir = '';
   String _docsDir = '';
 
-  int _activeTab = 0; // 0: Musica, 1: Videos, 2: Privado, 3: Ajustes
+  int _activeTab = 0; // 0: Musica, 1: Buscar, 2: Videos, 3: Privado, 4: Ajustes
   String _musicFilter = 'Todas';
   String _videoFilter = 'Todas';
   String _musicSort = 'recientes';
@@ -1120,21 +1175,43 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     if (_docsDir.isEmpty) return;
     try {
       final cacheFile = File('$_docsDir/library_cache.json');
-      if (!await cacheFile.exists()) return;
-      final raw = await cacheFile.readAsString();
-      final decoded = jsonDecode(raw) as List<dynamic>;
-      final loaded = <MediaTrack>[];
-      for (final item in decoded) {
-        if (item is Map<String, dynamic>) {
-          final track = MediaTrack.fromJson(item);
-          if (track.path.isNotEmpty) {
-            _applyOverrideToTrack(track);
-            loaded.add(track);
+      if (await cacheFile.exists()) {
+        final raw = await cacheFile.readAsString();
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        final loaded = <MediaTrack>[];
+        for (final item in decoded) {
+          if (item is Map<String, dynamic>) {
+            final track = MediaTrack.fromJson(item);
+            if (track.path.isNotEmpty) {
+              _applyOverrideToTrack(track);
+              loaded.add(track);
+            }
           }
         }
+        if (loaded.isNotEmpty && mounted) {
+          setState(() => _allTracks = loaded);
+        }
       }
-      if (loaded.isNotEmpty && mounted) {
-        setState(() => _allTracks = loaded);
+    } catch (_) {}
+
+    try {
+      final onlineFile = File('$_docsDir/online_tracks.json');
+      if (await onlineFile.exists()) {
+        final raw = await onlineFile.readAsString();
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        final loadedOnline = <String, MediaTrack>{};
+        for (final item in decoded) {
+          if (item is Map<String, dynamic>) {
+            final track = MediaTrack.fromJson(item);
+            if (track.path.isNotEmpty && track.isOnline) {
+              _applyOverrideToTrack(track);
+              loadedOnline[track.path] = track;
+            }
+          }
+        }
+        if (loadedOnline.isNotEmpty && mounted) {
+          setState(() => _savedOnlineTracks = loadedOnline);
+        }
       }
     } catch (_) {}
   }
@@ -1146,6 +1223,22 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       final encoded = jsonEncode(tracks.map((t) => t.toJson()).toList());
       await cacheFile.writeAsString(encoded, flush: true);
     } catch (_) {}
+  }
+
+  Future<void> _saveOnlineTracksCache() async {
+    if (_docsDir.isEmpty) return;
+    try {
+      final onlineFile = File('$_docsDir/online_tracks.json');
+      final list = _savedOnlineTracks.values.toList();
+      final encoded = jsonEncode(list.map((t) => t.toJson()).toList());
+      await onlineFile.writeAsString(encoded, flush: true);
+    } catch (_) {}
+  }
+
+  void _rememberOnlineTrack(MediaTrack track) {
+    if (!track.isOnline) return;
+    _savedOnlineTracks[track.path] = track;
+    unawaited(_saveOnlineTracksCache());
   }
 
   Future<void> _prepareLogoAsset() async {
@@ -1167,6 +1260,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     final favList = prefs.getStringList('favorites') ?? [];
+    final recentOnline = prefs.getStringList('recent_online_searches') ?? [];
     final privList = prefs.getStringList('private_paths') ?? [];
     final plRaw = prefs.getString('playlists');
     final dailyRaw = prefs.getString('daily_seconds');
@@ -1260,6 +1354,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       _trackPlayCounts = parsedPlayCounts;
       _trackOverrides = parsedOverrides;
       _customLyrics = parsedLyrics;
+      _recentOnlineSearches = recentOnline;
     });
   }
 
@@ -1285,6 +1380,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     await prefs.setString('track_play_counts', jsonEncode(_trackPlayCounts));
     await prefs.setString('track_overrides', jsonEncode(_trackOverrides));
     await prefs.setString('custom_lyrics', jsonEncode(_customLyrics));
+    await prefs.setStringList('recent_online_searches', _recentOnlineSearches);
   }
 
   Future<void> _applySavedEqualizer() async {
@@ -1320,6 +1416,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     };
     _audioHandler.onCrossfadeTrigger = () async {
       await _nextTrack(useCrossfade: true);
+    };
+    _audioHandler.onPreloadNext = () async {
+      await _preloadNextOnlineTrack();
     };
     _audioHandler.onHeadphonesDisconnected = () async {
       bool pausedAny = false;
@@ -1381,12 +1480,15 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     _audioHandler.onSkipPrevious = null;
     _audioHandler.onTrackCompleted = null;
     _audioHandler.onCrossfadeTrigger = null;
+    _audioHandler.onPreloadNext = null;
     _audioHandler.onHeadphonesDisconnected = null;
+    _ytClient.close();
     _videoController?.dispose();
     _sheetController.dispose();
     _vinylController.dispose();
     _lyricsScrollCtrl.dispose();
     _musicSearchCtrl.dispose();
+    _onlineSearchCtrl.dispose();
     _videoSearchCtrl.dispose();
     _pinCtrl.dispose();
     _newPinCtrl.dispose();
@@ -1455,6 +1557,172 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       setState(() {
         _currentLyrics = parsed;
         _lastScrolledLyricIdx = -1;
+      });
+    }
+  }
+
+  // --- Buscador y streaming de musica en linea (YouTube Audio) ---
+
+  Future<String?> _resolveOnlineAudioUrl(MediaTrack track) async {
+    final vid = track.onlineVideoId;
+    if (vid == null || vid.isEmpty) return null;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final cachedUrl = _streamUrlCache[vid];
+    final exp = _streamUrlExpMs[vid] ?? 0;
+    if (cachedUrl != null && now < exp) {
+      return cachedUrl;
+    }
+
+    try {
+      final manifest = await _ytClient.videos.streamsClient
+          .getManifest(vid)
+          .timeout(const Duration(seconds: 15));
+      yt.StreamInfo? chosen;
+      final audioStreams = manifest.audioOnly.toList();
+      if (audioStreams.isNotEmpty) {
+        audioStreams.sort((a, b) => b.bitrate.compareTo(a.bitrate));
+        final mp4s = audioStreams
+            .where((s) => s.container.name.toLowerCase() == 'mp4')
+            .toList();
+        chosen = mp4s.isNotEmpty ? mp4s.first : audioStreams.first;
+      } else if (manifest.muxed.isNotEmpty) {
+        final muxed = manifest.muxed.toList()
+          ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
+        chosen = muxed.first;
+      }
+      if (chosen == null) return null;
+      final urlStr = chosen.url.toString();
+      _streamUrlCache[vid] = urlStr;
+      _streamUrlExpMs[vid] = now + (90 * 60 * 1000);
+      return urlStr;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _downloadRemoteThumb(MediaTrack track) async {
+    if (!track.isOnline) return;
+    if (track.coverPath != null && File(track.coverPath!).existsSync()) return;
+    final url = track.remoteArtUrl;
+    final vid = track.onlineVideoId;
+    if (url == null || url.isEmpty || vid == null || _cacheDir.isEmpty) return;
+
+    final outFile = File('$_cacheDir/yt_thumb_$vid.jpg');
+    if (await outFile.exists()) {
+      track.coverPath = outFile.path;
+      _rememberOnlineTrack(track);
+      if (mounted && _currentTrack?.path == track.path) {
+        setState(() {});
+        unawaited(_refreshDynamicColorFor(track));
+      }
+      return;
+    }
+
+    HttpClient? client;
+    try {
+      client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 8);
+      final req = await client.getUrl(Uri.parse(url));
+      final resp = await req.close().timeout(const Duration(seconds: 10));
+      if (resp.statusCode == 200) {
+        final bytes = <int>[];
+        await for (final chunk in resp) {
+          bytes.addAll(chunk);
+        }
+        if (bytes.length > 100) {
+          await outFile.writeAsBytes(bytes, flush: true);
+          track.coverPath = outFile.path;
+          _rememberOnlineTrack(track);
+          if (mounted && _currentTrack?.path == track.path) {
+            setState(() {});
+            _audioHandler.updateCurrentMetadata(
+              track.path,
+              artUri: Uri.file(outFile.path),
+            );
+            unawaited(_refreshDynamicColorFor(track));
+          }
+        }
+      }
+    } catch (_) {
+    } finally {
+      client?.close(force: true);
+    }
+  }
+
+  Future<void> _preloadNextOnlineTrack() async {
+    if (_currentTrack == null || _currentTrack!.isVideo || _activeAudioQueue.length < 2) {
+      return;
+    }
+    if (_shuffle) return;
+    final curIdx = _activeAudioQueue.indexWhere((t) => t.path == _currentTrack!.path);
+    if (curIdx < 0) return;
+    final nextTrack = _activeAudioQueue[(curIdx + 1) % _activeAudioQueue.length];
+    if (nextTrack.isOnline) {
+      unawaited(_resolveOnlineAudioUrl(nextTrack));
+      unawaited(_downloadRemoteThumb(nextTrack));
+    }
+  }
+
+  Future<void> _searchOnlineMusic(String rawQuery) async {
+    final q = rawQuery.trim();
+    if (q.isEmpty) return;
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _searchingOnline = true;
+      _onlineError = null;
+      _recentOnlineSearches.removeWhere((s) => s.toLowerCase() == q.toLowerCase());
+      _recentOnlineSearches.insert(0, q);
+      if (_recentOnlineSearches.length > 8) {
+        _recentOnlineSearches = _recentOnlineSearches.sublist(0, 8);
+      }
+    });
+    unawaited(_savePrefs());
+
+    try {
+      final searchList = await _ytClient.search
+          .search(q)
+          .timeout(const Duration(seconds: 15));
+      final items = <MediaTrack>[];
+      for (final v in searchList) {
+        if (v.isLive) continue;
+        final vid = v.id.value;
+        final trackPath = 'yt://$vid';
+        final existing = _savedOnlineTracks[trackPath];
+        final thumbUrl = v.thumbnails.highResUrl.isNotEmpty
+            ? v.thumbnails.highResUrl
+            : v.thumbnails.mediumResUrl;
+        final track = MediaTrack(
+          path: trackPath,
+          title: existing?.title ?? v.title,
+          artist: existing?.artist ?? v.author,
+          folder: 'En línea',
+          ext: 'ONLINE',
+          isVideo: false,
+          modifiedMs: DateTime.now().millisecondsSinceEpoch,
+          coverPath: existing?.coverPath,
+          metadataLoaded: true,
+          isOnline: true,
+          onlineVideoId: vid,
+          remoteArtUrl: thumbUrl,
+          durationMs: v.duration?.inMilliseconds,
+        );
+        _applyOverrideToTrack(track);
+        items.add(track);
+        if (items.length >= 25) break;
+      }
+      if (!mounted) return;
+      setState(() {
+        _onlineResults = items;
+        _searchingOnline = false;
+        if (items.isEmpty) {
+          _onlineError = 'No encontré resultados para "$q".';
+        }
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _searchingOnline = false;
+        _onlineError = 'Sin conexión o no se pudo buscar ahora. Intenta de nuevo.';
       });
     }
   }
@@ -1642,8 +1910,20 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     return copy;
   }
 
+  List<MediaTrack> _getCombinedAudioPool() {
+    final local = _getList(isVideo: false, onlyPrivate: false);
+    final seen = {for (final t in local) t.path};
+    final combined = List<MediaTrack>.from(local);
+    for (final t in _savedOnlineTracks.values) {
+      if (!seen.contains(t.path) && !_privatePaths.contains(t.path)) {
+        combined.add(t);
+      }
+    }
+    return combined;
+  }
+
   List<MediaTrack> _getTopTracks({int limit = 25}) {
-    final music = _getList(isVideo: false, onlyPrivate: false)
+    final music = _getCombinedAudioPool()
         .where((t) => (_trackPlayCounts[t.path] ?? 0) > 0)
         .toList();
     music.sort((a, b) {
@@ -1676,8 +1956,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     if (!isVideo && filter.startsWith('PL::')) {
       final plName = filter.substring(4);
       final paths = _playlists[plName] ?? [];
-      final byPath = {for (final t in _getList(isVideo: false, onlyPrivate: false)) t.path: t};
+      final byPath = {for (final t in _getCombinedAudioPool()) t.path: t};
       base = [for (final p in paths) if (byPath.containsKey(p)) byPath[p]!];
+    } else if (!isVideo && filter == 'Favoritos') {
+      base = _getCombinedAudioPool()
+          .where((t) => _favorites.contains(t.path))
+          .toList();
     } else {
       base = _getList(isVideo: isVideo, onlyPrivate: false).where((t) {
         if (filter == 'Favoritos') return _favorites.contains(t.path);
@@ -1750,11 +2034,19 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
     await _exitVideoFullscreen();
     await _disposeVideo();
-    final hadMeta = track.metadataLoaded;
-    await Id3Reader.loadTrackMetadata(track, _cacheDir);
-    _applyOverrideToTrack(track);
-    if (!hadMeta && track.metadataLoaded && _allTracks.isNotEmpty) {
-      unawaited(_saveCachedLibrary(_allTracks));
+    final reqToken = ++_playRequestToken;
+
+    if (track.isOnline) {
+      _rememberOnlineTrack(track);
+      _applyOverrideToTrack(track);
+      unawaited(_downloadRemoteThumb(track));
+    } else {
+      final hadMeta = track.metadataLoaded;
+      await Id3Reader.loadTrackMetadata(track, _cacheDir);
+      _applyOverrideToTrack(track);
+      if (!hadMeta && track.metadataLoaded && _allTracks.isNotEmpty) {
+        unawaited(_saveCachedLibrary(_allTracks));
+      }
     }
 
     final validQueue = queue.isEmpty ? [track] : List<MediaTrack>.from(queue);
@@ -1764,7 +2056,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     if (mounted) {
       setState(() {
         _currentTrack = track;
-        _isPlaying = true;
+        _loadingOnlineTrack = track.isOnline;
+        _isPlaying = !track.isOnline;
         _draggingSeekSec = null;
         _lastScrolledLyricIdx = -1;
       });
@@ -1774,26 +2067,48 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     unawaited(_loadLyricsForTrack(track));
     if (openSheet) _openPlayerSheet();
 
-    try {
-      final Uri? art = (track.coverPath != null && File(track.coverPath!).existsSync())
-          ? Uri.file(track.coverPath!)
-          : _defaultLogoUri;
+    String? streamUrl;
+    if (track.isOnline) {
+      streamUrl = await _resolveOnlineAudioUrl(track);
+      if (reqToken != _playRequestToken) return;
+      if (streamUrl == null) {
+        if (mounted) {
+          setState(() {
+            _loadingOnlineTrack = false;
+            _isPlaying = false;
+          });
+          _syncVinylAnimation();
+          _showSnack('No se pudo cargar el audio en línea. Revisa tu conexión.');
+        }
+        return;
+      }
+    }
 
+    try {
+      Uri? resolveArt(MediaTrack t) {
+        if (t.coverPath != null && File(t.coverPath!).existsSync()) {
+          return Uri.file(t.coverPath!);
+        }
+        if (t.remoteArtUrl != null && t.remoteArtUrl!.isNotEmpty) {
+          return Uri.tryParse(t.remoteArtUrl!) ?? _defaultLogoUri;
+        }
+        return _defaultLogoUri;
+      }
+
+      final Uri? art = resolveArt(track);
       final mediaQueue = validQueue.map((t) {
-        final Uri? tArt = (t.coverPath != null && File(t.coverPath!).existsSync())
-            ? Uri.file(t.coverPath!)
-            : _defaultLogoUri;
         return MediaItem(
           id: t.path,
           title: t.title,
           artist: t.artist,
           album: t.folder,
-          artUri: tArt,
+          artUri: resolveArt(t),
         );
       }).toList();
 
       await _audioHandler.playMediaTrack(
         path: track.path,
+        sourceUrl: streamUrl,
         title: track.title,
         artist: track.artist,
         album: track.folder,
@@ -1805,12 +2120,26 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         repeatOne: _repeat,
         useCrossfade: useCrossfade,
       );
+      if (mounted && reqToken == _playRequestToken) {
+        setState(() {
+          _loadingOnlineTrack = false;
+          _isPlaying = true;
+        });
+        _syncVinylAnimation();
+      }
       unawaited(_applySavedEqualizer());
     } catch (_) {
-      if (mounted) {
-        setState(() => _isPlaying = false);
+      if (mounted && reqToken == _playRequestToken) {
+        setState(() {
+          _loadingOnlineTrack = false;
+          _isPlaying = false;
+        });
         _syncVinylAnimation();
-        _showSnack('No se pudo reproducir este archivo.');
+        _showSnack(
+          track.isOnline
+              ? 'No se pudo reproducir esta canción en línea.'
+              : 'No se pudo reproducir este archivo.',
+        );
       }
     }
   }
@@ -1839,7 +2168,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   Future<void> _togglePlayPause() async {
     if (_currentTrack == null) {
-      final list = _filteredList(_activeTab == 1);
+      final list = _filteredList(_activeTab == 2);
       if (list.isNotEmpty) {
         await _playTrack(list.first, list, openSheet: true);
       }
@@ -1999,6 +2328,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   // --- Cola "A continuacion" ---
 
   void _playNextInQueue(MediaTrack track) {
+    if (track.isOnline) _rememberOnlineTrack(track);
     if (track.isVideo) {
       _playTrack(track, _filteredList(true), openSheet: true);
       return;
@@ -2017,6 +2347,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   }
 
   void _appendToQueue(MediaTrack track) {
+    if (track.isOnline) _rememberOnlineTrack(track);
     if (track.isVideo) return;
     if (_currentTrack == null || _currentTrack!.isVideo || _activeAudioQueue.isEmpty) {
       _playTrack(track, [track], openSheet: true);
@@ -2790,35 +3121,38 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     leading: Icon(Icons.playlist_add_rounded, color: _subtext),
                     title: Text('Agregar a una lista', style: TextStyle(color: _text, fontSize: 14)),
                     onTap: () {
+                      if (track.isOnline) _rememberOnlineTrack(track);
                       Navigator.pop(ctx);
                       _showAddToPlaylistDialog(track.path);
                     },
                   ),
-                  ListTile(
-                    leading: Icon(Icons.edit_rounded, color: _subtext),
-                    title: Text('Editar nombre, artista y portada', style: TextStyle(color: _text, fontSize: 14)),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _showEditTrackSheet(track);
-                    },
-                  ),
+                  if (!track.isOnline)
+                    ListTile(
+                      leading: Icon(Icons.edit_rounded, color: _subtext),
+                      title: Text('Editar nombre, artista y portada', style: TextStyle(color: _text, fontSize: 14)),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _showEditTrackSheet(track);
+                      },
+                    ),
                 ],
                 ListTile(
                   leading: Icon(isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded, color: isFav ? _accent : _subtext),
                   title: Text(isFav ? 'Quitar de Favoritos' : 'Guardar en Favoritos', style: TextStyle(color: _text, fontSize: 14)),
                   onTap: () {
                     Navigator.pop(ctx);
-                    _toggleFavorite(track.path);
+                    _toggleFavorite(track.path, track: track);
                   },
                 ),
-                ListTile(
-                  leading: Icon(Icons.lock_outline_rounded, color: _subtext),
-                  title: Text('Mover a Zona Privada', style: TextStyle(color: _text, fontSize: 14)),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _moveToPrivate(track.path);
-                  },
-                ),
+                if (!track.isOnline)
+                  ListTile(
+                    leading: Icon(Icons.lock_outline_rounded, color: _subtext),
+                    title: Text('Mover a Zona Privada', style: TextStyle(color: _text, fontSize: 14)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _moveToPrivate(track.path);
+                    },
+                  ),
               ],
             ),
           ),
@@ -2829,7 +3163,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   // --- Favoritos, playlists, velocidad, temporizador ---
 
-  void _toggleFavorite(String path) {
+  void _toggleFavorite(String path, {MediaTrack? track}) {
+    if (track != null && track.isOnline) _rememberOnlineTrack(track);
     setState(() {
       if (_favorites.contains(path)) {
         _favorites.remove(path);
@@ -3059,6 +3394,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       labelContent = ClipOval(
         child: Image.file(coverFile, width: labelSize, height: labelSize, fit: BoxFit.cover),
       );
+    } else if (track?.remoteArtUrl != null && track!.remoteArtUrl!.isNotEmpty) {
+      labelContent = ClipOval(
+        child: Image.network(
+          track.remoteArtUrl!,
+          width: labelSize,
+          height: labelSize,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => Icon(Icons.headphones_rounded, color: Colors.white, size: labelSize * 0.45),
+        ),
+      );
     } else if (_hasLogoAsset) {
       labelContent = Container(
         width: labelSize,
@@ -3200,6 +3545,22 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           width: size,
           height: size,
           fit: BoxFit.cover,
+        ),
+      );
+    } else if (track?.remoteArtUrl != null && track!.remoteArtUrl!.isNotEmpty) {
+      inner = ClipRRect(
+        borderRadius: BorderRadius.circular(26),
+        child: Image.network(
+          track.remoteArtUrl!,
+          width: size,
+          height: size,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => Container(
+            width: size,
+            height: size,
+            color: _surfaceAlt,
+            child: Icon(Icons.headphones_rounded, size: size * 0.36, color: acc),
+          ),
         ),
       );
     } else if (_hasLogoAsset) {
@@ -3549,12 +3910,19 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                 scale: Tween<double>(begin: 0.65, end: 1.0).animate(anim),
                 child: FadeTransition(opacity: anim, child: child),
               ),
-              child: Icon(
-                _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                key: ValueKey<bool>(_isPlaying),
-                color: Colors.white,
-                size: iconSize,
-              ),
+              child: _loadingOnlineTrack
+                  ? SizedBox(
+                      key: const ValueKey<String>('loading'),
+                      width: iconSize * 0.68,
+                      height: iconSize * 0.68,
+                      child: const CircularProgressIndicator(strokeWidth: 3, color: Colors.white),
+                    )
+                  : Icon(
+                      _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                      key: ValueKey<bool>(_isPlaying),
+                      color: Colors.white,
+                      size: iconSize,
+                    ),
             ),
           ],
         ),
@@ -3629,12 +3997,367 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       case 0:
         return _buildMediaListTab(isVideo: false);
       case 1:
-        return _buildMediaListTab(isVideo: true);
+        return _buildOnlineSearchTab();
       case 2:
+        return _buildMediaListTab(isVideo: true);
+      case 3:
         return _buildPrivateTab();
       default:
         return _buildSettingsTab();
     }
+  }
+
+  // --- Pestana Buscador de Musica en Linea ---
+
+  Widget _buildOnlineSearchTab() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  _buildLogoAvatar(40),
+                  const SizedBox(width: 10),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'relaxPlayer',
+                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _accent),
+                      ),
+                      Text(
+                        'En línea',
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: _text),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              IconButton(
+                icon: Icon(Icons.equalizer_rounded, color: _eqEnabled ? _accent : _subtext, size: 23),
+                tooltip: 'Ecualizador',
+                onPressed: _showEqualizerSheet,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // Barra de busqueda en linea
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _onlineSearchCtrl,
+                  textInputAction: TextInputAction.search,
+                  style: TextStyle(color: _text, fontSize: 14),
+                  onChanged: (_) => setState(() {}),
+                  onSubmitted: _searchOnlineMusic,
+                  decoration: InputDecoration(
+                    hintText: 'Busca cualquier canción o artista...',
+                    hintStyle: TextStyle(color: _subtext, fontSize: 13),
+                    prefixIcon: Icon(Icons.search_rounded, color: _subtext, size: 20),
+                    suffixIcon: _onlineSearchCtrl.text.isNotEmpty
+                        ? IconButton(
+                            icon: Icon(Icons.close_rounded, color: _subtext, size: 18),
+                            onPressed: () {
+                              _onlineSearchCtrl.clear();
+                              setState(() {
+                                _onlineResults = [];
+                                _onlineError = null;
+                              });
+                            },
+                          )
+                        : null,
+                    filled: true,
+                    fillColor: _surface,
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 11, horizontal: 12),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide(color: _border),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide(color: _border),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide(color: _accent),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              _SpringPressButton(
+                onTap: () => _searchOnlineMusic(_onlineSearchCtrl.text),
+                child: Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: _accent,
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: const Icon(Icons.arrow_forward_rounded, color: Colors.white, size: 22),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          Expanded(
+            child: _searchingOnline
+                ? Center(
+                    child: Padding(
+                      padding: EdgeInsets.only(bottom: _bottomScrollClearance),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircularProgressIndicator(color: _accent),
+                          const SizedBox(height: 14),
+                          Text('Buscando en línea...', style: TextStyle(fontSize: 13, color: _subtext)),
+                        ],
+                      ),
+                    ),
+                  )
+                : _onlineResults.isEmpty
+                    ? ListView(
+                        padding: EdgeInsets.only(bottom: _bottomScrollClearance),
+                        children: [
+                          if (_onlineError != null) ...[
+                            Container(
+                              padding: const EdgeInsets.all(16),
+                              margin: const EdgeInsets.only(bottom: 14),
+                              decoration: BoxDecoration(
+                                color: _surface,
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(color: withA(_accent, 0.3)),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.wifi_off_rounded, color: _accent, size: 24),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Text(_onlineError!, style: TextStyle(fontSize: 12, color: _text)),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+
+                          // Busquedas recientes
+                          if (_recentOnlineSearches.isNotEmpty) ...[
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text('Recientes', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text)),
+                                TextButton(
+                                  onPressed: () {
+                                    setState(() => _recentOnlineSearches.clear());
+                                    _savePrefs();
+                                  },
+                                  child: Text('Limpiar', style: TextStyle(fontSize: 11, color: _subtext)),
+                                ),
+                              ],
+                            ),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: _recentOnlineSearches.map((term) {
+                                return InkWell(
+                                  borderRadius: BorderRadius.circular(16),
+                                  onTap: () {
+                                    _onlineSearchCtrl.text = term;
+                                    _searchOnlineMusic(term);
+                                  },
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                                    decoration: BoxDecoration(
+                                      color: _surface,
+                                      borderRadius: BorderRadius.circular(16),
+                                      border: Border.all(color: _border),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.history_rounded, size: 14, color: _subtext),
+                                        const SizedBox(width: 6),
+                                        Text(term, style: TextStyle(fontSize: 12, color: _text)),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                            const SizedBox(height: 18),
+                          ],
+
+                          // Explorar por estilo
+                          Text('Explorar estilos', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text)),
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: kOnlineQuickGenres.map((genre) {
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(18),
+                                onTap: () {
+                                  _onlineSearchCtrl.text = genre;
+                                  _searchOnlineMusic(genre);
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: withA(_accent, 0.14),
+                                    borderRadius: BorderRadius.circular(18),
+                                    border: Border.all(color: withA(_accent, 0.32)),
+                                  ),
+                                  child: Text(
+                                    genre,
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _text),
+                                  ),
+                                ),
+                              );
+                            }).toList(),
+                          ),
+                          const SizedBox(height: 22),
+
+                          // Tarjeta informativa limpia
+                          Container(
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: _surface,
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(color: _border),
+                            ),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 44,
+                                  height: 44,
+                                  decoration: BoxDecoration(
+                                    color: withA(_accent, 0.18),
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Icon(Icons.public_rounded, color: _accent, size: 22),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text('Escucha sin descargar', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text)),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        'Mezcla canciones en línea en la misma cola con tus temas descargados, usando tu ecualizador y crossfade.',
+                                        style: TextStyle(fontSize: 11, color: _subtext),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.builder(
+                        itemCount: _onlineResults.length,
+                        itemExtent: 68,
+                        padding: EdgeInsets.only(bottom: _bottomScrollClearance),
+                        itemBuilder: (_, i) {
+                          final t = _onlineResults[i];
+                          final isCurrent = _currentTrack?.path == t.path;
+                          final isFav = _favorites.contains(t.path);
+                          final durText = t.durationMs != null && t.durationMs! > 0
+                              ? '  ·  ${formatTime(Duration(milliseconds: t.durationMs!))}'
+                              : '';
+
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Material(
+                              color: isCurrent ? withA(_accent, 0.16) : _surface,
+                              borderRadius: BorderRadius.circular(12),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(12),
+                                onTap: () => _playTrack(t, _onlineResults, openSheet: true),
+                                onLongPress: () => _showTrackOptionsSheet(t),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                  child: Row(
+                                    children: [
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(10),
+                                        child: (t.remoteArtUrl != null && t.remoteArtUrl!.isNotEmpty)
+                                            ? Image.network(
+                                                t.remoteArtUrl!,
+                                                width: 46,
+                                                height: 46,
+                                                fit: BoxFit.cover,
+                                                errorBuilder: (_, __, ___) => Container(
+                                                  width: 46,
+                                                  height: 46,
+                                                  color: _surfaceAlt,
+                                                  child: Icon(Icons.music_note_rounded, color: _accent, size: 22),
+                                                ),
+                                              )
+                                            : Container(
+                                                width: 46,
+                                                height: 46,
+                                                color: _surfaceAlt,
+                                                child: Icon(Icons.music_note_rounded, color: _accent, size: 22),
+                                              ),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Column(
+                                          mainAxisAlignment: MainAxisAlignment.center,
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              t.title,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w600,
+                                                color: isCurrent ? _accent : _text,
+                                              ),
+                                            ),
+                                            Text(
+                                              '${t.artist}$durText',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(fontSize: 11, color: _subtext),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: Icon(
+                                          isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                                          size: 19,
+                                          color: isFav ? _accent : _subtext,
+                                        ),
+                                        onPressed: () => _toggleFavorite(t.path, track: t),
+                                      ),
+                                      IconButton(
+                                        icon: Icon(Icons.more_vert_rounded, size: 20, color: _subtext),
+                                        onPressed: () => _showTrackOptionsSheet(t),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+    );
   }
 
   // --- Pestana Musica / Videos ---
@@ -3978,7 +4701,23 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                             fit: BoxFit.cover,
                                           ),
                                         )
-                                      : Container(
+                                      : (!isVideo && t.remoteArtUrl != null && t.remoteArtUrl!.isNotEmpty)
+                                          ? ClipRRect(
+                                              borderRadius: BorderRadius.circular(10),
+                                              child: Image.network(
+                                                t.remoteArtUrl!,
+                                                width: 42,
+                                                height: 42,
+                                                fit: BoxFit.cover,
+                                                errorBuilder: (_, __, ___) => Container(
+                                                  width: 42,
+                                                  height: 42,
+                                                  color: _surfaceAlt,
+                                                  child: Icon(Icons.public_rounded, size: 20, color: _accent),
+                                                ),
+                                              ),
+                                            )
+                                          : Container(
                                           width: 42,
                                           height: 42,
                                           decoration: BoxDecoration(
@@ -4659,6 +5398,22 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         borderRadius: BorderRadius.circular(12),
         child: Image.file(coverFile, width: 42, height: 42, fit: BoxFit.cover),
       );
+    } else if (!track.isVideo && track.remoteArtUrl != null && track.remoteArtUrl!.isNotEmpty) {
+      thumb = ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Image.network(
+          track.remoteArtUrl!,
+          width: 42,
+          height: 42,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => Container(
+            width: 42,
+            height: 42,
+            color: withA(acc, 0.25),
+            child: Icon(Icons.music_note_rounded, color: acc, size: 22),
+          ),
+        ),
+      );
     } else if (!track.isVideo && _hasLogoAsset) {
       thumb = Container(
         width: 42,
@@ -4761,11 +5516,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             BoxShadow(color: withA(acc, 0.40), blurRadius: 10),
                           ],
                         ),
-                        child: Icon(
-                          _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                          color: Colors.white,
-                          size: 21,
-                        ),
+                        child: _loadingOnlineTrack
+                            ? const Padding(
+                                padding: EdgeInsets.all(9),
+                                child: CircularProgressIndicator(strokeWidth: 2.2, color: Colors.white),
+                              )
+                            : Icon(
+                                _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                                color: Colors.white,
+                                size: 21,
+                              ),
                       ),
                     ),
                     const SizedBox(width: 6),
@@ -4797,9 +5557,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final dark = widget.darkMode;
     const items = [
       (0, Icons.music_note_rounded, 'Música'),
-      (1, Icons.video_library_rounded, 'Videos'),
-      (2, Icons.lock_rounded, 'Privado'),
-      (3, Icons.tune_rounded, 'Ajustes'),
+      (1, Icons.search_rounded, 'Buscar'),
+      (2, Icons.video_library_rounded, 'Videos'),
+      (3, Icons.lock_rounded, 'Privado'),
+      (4, Icons.tune_rounded, 'Ajustes'),
     ];
 
     return Container(
@@ -5025,7 +5786,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         ),
                         Column(
                           children: [
-                            Text('REPRODUCIENDO', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, letterSpacing: 1.2, color: _subtext)),
+                            Text(
+                              track.isOnline ? 'EN LÍNEA' : 'REPRODUCIENDO',
+                              style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, letterSpacing: 1.2, color: track.isOnline ? acc : _subtext),
+                            ),
                             Text('relaxPlayer', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text)),
                           ],
                         ),
@@ -5128,7 +5892,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       size: 38,
                       iconSize: 19,
                       active: isFav,
-                      onTap: () => _toggleFavorite(track.path),
+                      onTap: () => _toggleFavorite(track.path, track: track),
                     ),
                   ],
                 ),
