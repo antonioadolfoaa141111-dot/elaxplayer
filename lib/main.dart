@@ -31,6 +31,7 @@ Future<void> main() async {
       androidNotificationClickStartsActivity: true,
     ),
   );
+  await _audioHandler.initAudioSession();
   runApp(const RelaxPlayerApp());
 }
 
@@ -58,42 +59,191 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     action: MediaAction.skipToNext,
   );
 
-  final AndroidEqualizer equalizer = AndroidEqualizer();
-  final AndroidLoudnessEnhancer loudnessEnhancer = AndroidLoudnessEnhancer();
+  // Dos motores independientes con su propio ecualizador para crossfade real sin cortes
+  final AndroidEqualizer _eqA = AndroidEqualizer();
+  final AndroidLoudnessEnhancer _loudA = AndroidLoudnessEnhancer();
+  final AndroidEqualizer _eqB = AndroidEqualizer();
+  final AndroidLoudnessEnhancer _loudB = AndroidLoudnessEnhancer();
 
-  late final AudioPlayer player = AudioPlayer(
+  late final AudioPlayer _playerA = AudioPlayer(
     audioPipeline: Platform.isAndroid
-        ? AudioPipeline(androidAudioEffects: [loudnessEnhancer, equalizer])
+        ? AudioPipeline(androidAudioEffects: [_loudA, _eqA])
         : null,
   );
+  late final AudioPlayer _playerB = AudioPlayer(
+    audioPipeline: Platform.isAndroid
+        ? AudioPipeline(androidAudioEffects: [_loudB, _eqB])
+        : null,
+  );
+
+  bool _usingA = true;
+  AudioPlayer get player => _usingA ? _playerA : _playerB;
+  AudioPlayer get _standbyPlayer => _usingA ? _playerB : _playerA;
+  AndroidEqualizer get equalizer => _usingA ? _eqA : _eqB;
+  AndroidLoudnessEnhancer get loudnessEnhancer => _usingA ? _loudA : _loudB;
+
+  final StreamController<Duration> _posController = StreamController<Duration>.broadcast();
+  final StreamController<bool> _playingController = StreamController<bool>.broadcast();
+
+  Stream<Duration> get unifiedPositionStream => _posController.stream;
+  Stream<bool> get unifiedPlayingStream => _playingController.stream;
 
   Future<void> Function()? onSkipNext;
   Future<void> Function()? onSkipPrevious;
   Future<void> Function()? onTrackCompleted;
+  Future<void> Function()? onCrossfadeTrigger;
+  Future<void> Function()? onHeadphonesDisconnected;
 
+  bool autoPauseOnDisconnect = true;
+  int crossfadeSeconds = 4; // 0 = apagado, 2/4/6/8 segundos
+
+  double _baseVolume = 0.85;
+  bool _repeatOne = false;
   bool _completionSent = false;
+  bool _crossfading = false;
+  bool _resumeAfterInterruption = false;
+  int _fadeToken = 0;
   int _currentQueueIndex = 0;
+  Timer? _fadeTimer;
 
   RelaxAudioHandler() {
-    player.playbackEventStream.listen(_broadcastState);
-    player.playingStream.listen((_) => _broadcastState(player.playbackEvent));
-    player.processingStateStream.listen((state) {
+    _attachListeners(_playerA, isA: true);
+    _attachListeners(_playerB, isA: false);
+  }
+
+  void _attachListeners(AudioPlayer p, {required bool isA}) {
+    p.playbackEventStream.listen((ev) {
+      if (_usingA == isA) _broadcastState(ev);
+    });
+    p.playingStream.listen((playing) {
+      if (_usingA == isA) {
+        _playingController.add(playing);
+        _broadcastState(p.playbackEvent);
+      }
+    });
+    p.positionStream.listen((pos) {
+      if (_usingA != isA) return;
+      _posController.add(pos);
+
+      // Disparar transicion suave (Crossfade) cuando faltan X segundos para terminar
+      if (crossfadeSeconds > 0 && !_repeatOne && !_crossfading && p.playing) {
+        final dur = p.duration;
+        if (dur != null &&
+            dur.inSeconds > crossfadeSeconds + 4 &&
+            pos.inSeconds >= 3) {
+          final remaining = dur - pos;
+          if (remaining <= Duration(seconds: crossfadeSeconds) &&
+              remaining > const Duration(milliseconds: 350)) {
+            _crossfading = true;
+            onCrossfadeTrigger?.call();
+          }
+        }
+      }
+    });
+    p.processingStateStream.listen((state) {
+      if (_usingA != isA) return;
       if (state == ProcessingState.completed) {
-        if (!_completionSent) {
+        if (!_completionSent && !_crossfading) {
           _completionSent = true;
           onTrackCompleted?.call();
         }
       } else if (state == ProcessingState.ready) {
         _completionSent = false;
       }
-      _broadcastState(player.playbackEvent);
+      _broadcastState(p.playbackEvent);
     });
-    player.durationStream.listen((dur) {
+    p.durationStream.listen((dur) {
+      if (_usingA != isA) return;
       final current = mediaItem.value;
       if (current != null && dur != null && dur > Duration.zero && current.duration != dur) {
         mediaItem.add(current.copyWith(duration: dur));
       }
     });
+  }
+
+  Future<void> initAudioSession() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration.music());
+
+      // Pausa automatica al desconectar audifonos con cable o Bluetooth
+      session.becomingNoisyEventStream.listen((_) async {
+        if (!autoPauseOnDisconnect) return;
+        final wasPlaying = player.playing;
+        if (wasPlaying) {
+          await pause();
+        }
+        await onHeadphonesDisconnected?.call();
+      });
+
+      // Manejo limpio de llamadas o interrupciones del sistema
+      session.interruptionEventStream.listen((event) async {
+        if (event.begin) {
+          if (event.type == AudioInterruptionType.duck) {
+            await player.setVolume((_baseVolume * 0.25).clamp(0.0, 1.0));
+          } else {
+            _resumeAfterInterruption = player.playing;
+            if (player.playing) await pause();
+          }
+        } else {
+          if (event.type == AudioInterruptionType.duck) {
+            await player.setVolume(_baseVolume);
+          } else if (event.type == AudioInterruptionType.pause && _resumeAfterInterruption) {
+            _resumeAfterInterruption = false;
+            await play();
+          }
+        }
+      });
+    } catch (_) {}
+  }
+
+  void _cancelCrossfade({bool stopStandby = true}) {
+    _fadeToken++;
+    _fadeTimer?.cancel();
+    _fadeTimer = null;
+    _crossfading = false;
+    if (stopStandby) {
+      unawaited(_standbyPlayer.stop());
+    }
+  }
+
+  Future<void> setVolumeLive(double v) async {
+    _baseVolume = v.clamp(0.0, 1.0);
+    if (!_crossfading) {
+      await player.setVolume(_baseVolume);
+    }
+  }
+
+  Future<void> setSpeedLive(double s) async {
+    await player.setSpeed(s);
+  }
+
+  Future<void> setRepeatOne(bool repeat) async {
+    _repeatOne = repeat;
+    await player.setLoopMode(repeat ? LoopMode.one : LoopMode.off);
+  }
+
+  Future<void> applyEqualizerToBoth({
+    required bool enabled,
+    required double loudnessGain,
+    required List<double> bandGains,
+  }) async {
+    if (!Platform.isAndroid) return;
+    for (final pair in [(_eqA, _loudA), (_eqB, _loudB)]) {
+      try {
+        await pair.$1.setEnabled(enabled);
+        await pair.$2.setEnabled(enabled && loudnessGain > 0.01);
+        await pair.$2.setTargetGain(loudnessGain);
+        if (bandGains.isNotEmpty) {
+          final params = await pair.$1.parameters.timeout(const Duration(seconds: 2));
+          for (int i = 0; i < params.bands.length && i < bandGains.length; i++) {
+            await params.bands[i].setGain(
+              bandGains[i].clamp(params.minDecibels, params.maxDecibels),
+            );
+          }
+        }
+      } catch (_) {}
+    }
   }
 
   Future<void> playMediaTrack({
@@ -107,7 +257,10 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     required double volume,
     required double speed,
     required bool repeatOne,
+    bool useCrossfade = false,
   }) async {
+    _baseVolume = volume.clamp(0.0, 1.0);
+    _repeatOne = repeatOne;
     _completionSent = false;
     _currentQueueIndex = queueIndex.clamp(0, max(0, queueItems.length - 1));
 
@@ -126,16 +279,71 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     }
     mediaItem.add(currentItem);
 
-    final dur = await player.setFilePath(path);
+    if (useCrossfade && crossfadeSeconds > 0) {
+      final outgoing = player;
+      final incoming = _standbyPlayer;
+      final token = ++_fadeToken;
+      _fadeTimer?.cancel();
+
+      try {
+        final dur = await incoming.setFilePath(path);
+        if (dur != null && dur > Duration.zero) {
+          mediaItem.add(currentItem.copyWith(duration: dur));
+        }
+        await incoming.setSpeed(speed);
+        await incoming.setLoopMode(repeatOne ? LoopMode.one : LoopMode.off);
+        await incoming.setVolume(0.0);
+
+        // Intercambiar motor activo para que la barra y notificacion muestren el tema nuevo
+        _usingA = !_usingA;
+        _posController.add(Duration.zero);
+        _playingController.add(true);
+        unawaited(incoming.play());
+        _broadcastState(incoming.playbackEvent, forcePlaying: true);
+
+        const totalSteps = 24;
+        final stepMs = max(60, (crossfadeSeconds * 1000) ~/ totalSteps);
+        int step = 0;
+
+        _fadeTimer = Timer.periodic(Duration(milliseconds: stepMs), (timer) {
+          if (token != _fadeToken) {
+            timer.cancel();
+            return;
+          }
+          step++;
+          final t = (step / totalSteps).clamp(0.0, 1.0);
+          unawaited(outgoing.setVolume(_baseVolume * (1.0 - t)));
+          unawaited(incoming.setVolume(_baseVolume * t));
+
+          if (step >= totalSteps) {
+            timer.cancel();
+            _fadeTimer = null;
+            _crossfading = false;
+            unawaited(outgoing.stop());
+            unawaited(outgoing.setVolume(_baseVolume));
+          }
+        });
+        return;
+      } catch (_) {
+        _crossfading = false;
+        rethrow;
+      }
+    }
+
+    // Cambio manual instantaneo
+    _cancelCrossfade(stopStandby: true);
+    final active = player;
+    final dur = await active.setFilePath(path);
     if (dur != null && dur > Duration.zero) {
       mediaItem.add(currentItem.copyWith(duration: dur));
     }
-    await player.setVolume(volume);
-    await player.setSpeed(speed);
-    await player.setLoopMode(repeatOne ? LoopMode.one : LoopMode.off);
+    await active.setVolume(_baseVolume);
+    await active.setSpeed(speed);
+    await active.setLoopMode(repeatOne ? LoopMode.one : LoopMode.off);
 
-    unawaited(player.play());
-    _broadcastState(player.playbackEvent, forcePlaying: true);
+    unawaited(active.play());
+    _playingController.add(true);
+    _broadcastState(active.playbackEvent, forcePlaying: true);
   }
 
   void updateCurrentMetadata(String path, {String? title, String? artist, Uri? artUri}) {
@@ -152,7 +360,8 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
   }
 
   void _broadcastState(PlaybackEvent event, {bool? forcePlaying}) {
-    final playing = forcePlaying ?? player.playing;
+    final active = player;
+    final playing = forcePlaying ?? active.playing;
     const stateMap = <ProcessingState, AudioProcessingState>{
       ProcessingState.idle: AudioProcessingState.idle,
       ProcessingState.loading: AudioProcessingState.loading,
@@ -180,11 +389,11 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
           MediaAction.stop,
         },
         androidCompactActionIndices: const [0, 1, 2],
-        processingState: stateMap[player.processingState] ?? AudioProcessingState.ready,
+        processingState: stateMap[active.processingState] ?? AudioProcessingState.ready,
         playing: playing,
-        updatePosition: player.position,
-        bufferedPosition: player.bufferedPosition,
-        speed: player.speed,
+        updatePosition: active.position,
+        bufferedPosition: active.bufferedPosition,
+        speed: active.speed,
         queueIndex: _currentQueueIndex,
       ),
     );
@@ -192,19 +401,25 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
   @override
   Future<void> play() async {
+    await player.setVolume(_baseVolume);
     unawaited(player.play());
+    _playingController.add(true);
     _broadcastState(player.playbackEvent, forcePlaying: true);
   }
 
   @override
   Future<void> pause() async {
+    _cancelCrossfade(stopStandby: true);
     await player.pause();
+    await player.setVolume(_baseVolume);
+    _playingController.add(false);
     _broadcastState(player.playbackEvent, forcePlaying: false);
   }
 
   @override
   Future<void> seek(Duration position) async {
     await player.seek(position);
+    _posController.add(position);
     _broadcastState(player.playbackEvent);
   }
 
@@ -224,6 +439,7 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
   @override
   Future<void> stop() async {
+    _cancelCrossfade(stopStandby: true);
     await player.stop();
     await super.stop();
   }
@@ -812,6 +1028,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   // Nuevas preferencias de personalizacion
   bool _chameleonMode = true;
   bool _vinylMode = false;
+  bool _autoPauseDisconnect = true;
+  int _crossfadeSeconds = 4;
   Color? _dynamicAccent;
 
   // Ecualizador y refuerzo de bajos
@@ -845,13 +1063,14 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   Map<String, List<String>> _playlists = {};
   int _totalPlays = 0;
   Map<String, int> _dailySeconds = {for (final d in kWeekDays) d: 0};
+  Map<String, int> _trackPlayCounts = {};
 
   int _sleepRemainingSec = 0;
   Timer? _clockTimer;
   int _statsAccumSec = 0;
   double? _draggingSeekSec;
 
-  StreamSubscription<PlayerState>? _playerStateSub;
+  StreamSubscription<bool>? _playingSub;
   final Random _rng = Random();
 
   Color get _bg => widget.darkMode ? const Color(0xFF0B0B0F) : const Color(0xFFF4F4F8);
@@ -954,6 +1173,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final overridesRaw = prefs.getString('track_overrides');
     final lyricsRaw = prefs.getString('custom_lyrics');
     final eqGainsRaw = prefs.getString('eq_gains');
+    final countsRaw = prefs.getString('track_play_counts');
 
     Map<String, List<String>> parsedPl = {};
     if (plRaw != null) {
@@ -1004,12 +1224,30 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       } catch (_) {}
     }
 
+    Map<String, int> parsedPlayCounts = {};
+    if (countsRaw != null) {
+      try {
+        final decoded = jsonDecode(countsRaw) as Map<String, dynamic>;
+        for (final entry in decoded.entries) {
+          final v = (entry.value as num?)?.toInt() ?? 0;
+          if (v > 0) parsedPlayCounts[entry.key] = v;
+        }
+      } catch (_) {}
+    }
+
+    final autoPause = prefs.getBool('auto_pause_disconnect') ?? true;
+    final crossfade = prefs.getInt('crossfade_seconds') ?? 4;
+    _audioHandler.autoPauseOnDisconnect = autoPause;
+    _audioHandler.crossfadeSeconds = crossfade;
+
     if (!mounted) return;
     setState(() {
       _pin = prefs.getString('pin') ?? '1234';
       _volume = prefs.getDouble('volume') ?? 0.85;
       _chameleonMode = prefs.getBool('chameleon_mode') ?? true;
       _vinylMode = prefs.getBool('vinyl_mode') ?? false;
+      _autoPauseDisconnect = autoPause;
+      _crossfadeSeconds = crossfade;
       _eqEnabled = prefs.getBool('eq_enabled') ?? false;
       _eqPreset = prefs.getString('eq_preset') ?? 'Plano';
       _loudnessBoost = prefs.getDouble('loudness_boost') ?? 0.0;
@@ -1019,6 +1257,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       _playlists = parsedPl;
       _totalPlays = prefs.getInt('total_plays') ?? 0;
       _dailySeconds = parsedDaily;
+      _trackPlayCounts = parsedPlayCounts;
       _trackOverrides = parsedOverrides;
       _customLyrics = parsedLyrics;
     });
@@ -1032,6 +1271,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     await prefs.setDouble('volume', _volume);
     await prefs.setBool('chameleon_mode', _chameleonMode);
     await prefs.setBool('vinyl_mode', _vinylMode);
+    await prefs.setBool('auto_pause_disconnect', _autoPauseDisconnect);
+    await prefs.setInt('crossfade_seconds', _crossfadeSeconds);
     await prefs.setBool('eq_enabled', _eqEnabled);
     await prefs.setString('eq_preset', _eqPreset);
     await prefs.setDouble('loudness_boost', _loudnessBoost);
@@ -1041,26 +1282,17 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     await prefs.setString('playlists', jsonEncode(_playlists));
     await prefs.setInt('total_plays', _totalPlays);
     await prefs.setString('daily_seconds', jsonEncode(_dailySeconds));
+    await prefs.setString('track_play_counts', jsonEncode(_trackPlayCounts));
     await prefs.setString('track_overrides', jsonEncode(_trackOverrides));
     await prefs.setString('custom_lyrics', jsonEncode(_customLyrics));
   }
 
   Future<void> _applySavedEqualizer() async {
-    if (!Platform.isAndroid) return;
-    try {
-      await _audioHandler.equalizer.setEnabled(_eqEnabled);
-      await _audioHandler.loudnessEnhancer.setEnabled(_eqEnabled && _loudnessBoost > 0.01);
-      await _audioHandler.loudnessEnhancer.setTargetGain(_loudnessBoost);
-      if (_eqSavedGains.isNotEmpty) {
-        final params = await _audioHandler.equalizer.parameters.timeout(
-          const Duration(seconds: 2),
-        );
-        for (int i = 0; i < params.bands.length && i < _eqSavedGains.length; i++) {
-          final clamped = _eqSavedGains[i].clamp(params.minDecibels, params.maxDecibels);
-          await params.bands[i].setGain(clamped);
-        }
-      }
-    } catch (_) {}
+    await _audioHandler.applyEqualizerToBoth(
+      enabled: _eqEnabled,
+      loudnessGain: _loudnessBoost,
+      bandGains: _eqSavedGains,
+    );
   }
 
   void _syncVinylAnimation() {
@@ -1086,12 +1318,29 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     _audioHandler.onTrackCompleted = () async {
       await _nextTrack();
     };
+    _audioHandler.onCrossfadeTrigger = () async {
+      await _nextTrack(useCrossfade: true);
+    };
+    _audioHandler.onHeadphonesDisconnected = () async {
+      bool pausedAny = false;
+      if (_currentTrack?.isVideo == true && _videoController?.value.isPlaying == true) {
+        await _videoController?.pause();
+        pausedAny = true;
+      } else if (_isPlaying) {
+        pausedAny = true;
+      }
+      if (mounted && pausedAny) {
+        setState(() => _isPlaying = false);
+        _syncVinylAnimation();
+        _showSnack('Pausado al desconectar audífonos.');
+      }
+    };
 
-    _playerStateSub = _audioPlayer.playerStateStream.listen((st) {
+    _playingSub = _audioHandler.unifiedPlayingStream.listen((playing) {
       if (!mounted) return;
       if (_currentTrack != null && !_currentTrack!.isVideo) {
-        if (_isPlaying != st.playing) {
-          setState(() => _isPlaying = st.playing);
+        if (_isPlaying != playing) {
+          setState(() => _isPlaying = playing);
           _syncVinylAnimation();
         }
       }
@@ -1127,10 +1376,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     _clockTimer?.cancel();
     _videoHudTimer?.cancel();
     _videoControlsTimer?.cancel();
-    _playerStateSub?.cancel();
+    _playingSub?.cancel();
     _audioHandler.onSkipNext = null;
     _audioHandler.onSkipPrevious = null;
     _audioHandler.onTrackCompleted = null;
+    _audioHandler.onCrossfadeTrigger = null;
+    _audioHandler.onHeadphonesDisconnected = null;
     _videoController?.dispose();
     _sheetController.dispose();
     _vinylController.dispose();
@@ -1391,10 +1642,35 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     return copy;
   }
 
+  List<MediaTrack> _getTopTracks({int limit = 25}) {
+    final music = _getList(isVideo: false, onlyPrivate: false)
+        .where((t) => (_trackPlayCounts[t.path] ?? 0) > 0)
+        .toList();
+    music.sort((a, b) {
+      final ca = _trackPlayCounts[a.path] ?? 0;
+      final cb = _trackPlayCounts[b.path] ?? 0;
+      if (cb != ca) return cb.compareTo(ca);
+      return b.modifiedMs.compareTo(a.modifiedMs);
+    });
+    return music.length > limit ? music.sublist(0, limit) : music;
+  }
+
   List<MediaTrack> _filteredList(bool isVideo) {
     final filter = isVideo ? _videoFilter : _musicFilter;
     final query = (isVideo ? _videoQuery : _musicQuery).trim().toLowerCase();
     final sort = isVideo ? _videoSort : _musicSort;
+
+    if (!isVideo && filter == 'Top') {
+      var top = _getTopTracks(limit: 25);
+      if (query.isNotEmpty) {
+        top = top
+            .where((t) =>
+                t.title.toLowerCase().contains(query) ||
+                t.artist.toLowerCase().contains(query))
+            .toList();
+      }
+      return top;
+    }
 
     List<MediaTrack> base;
     if (!isVideo && filter.startsWith('PL::')) {
@@ -1422,8 +1698,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   // --- Reproduccion de audio y video ---
 
-  Future<void> _playTrack(MediaTrack track, List<MediaTrack> queue, {bool openSheet = true}) async {
+  Future<void> _playTrack(
+    MediaTrack track,
+    List<MediaTrack> queue, {
+    bool openSheet = true,
+    bool useCrossfade = false,
+  }) async {
     _totalPlays++;
+    if (!track.isVideo) {
+      _trackPlayCounts[track.path] = (_trackPlayCounts[track.path] ?? 0) + 1;
+    }
     _savePrefs();
 
     if (track.isVideo) {
@@ -1519,8 +1803,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         volume: _volume,
         speed: _speed,
         repeatOne: _repeat,
+        useCrossfade: useCrossfade,
       );
-      await _applySavedEqualizer();
+      unawaited(_applySavedEqualizer());
     } catch (_) {
       if (mounted) {
         setState(() => _isPlaying = false);
@@ -1578,7 +1863,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     }
   }
 
-  Future<void> _nextTrack() async {
+  Future<void> _nextTrack({bool useCrossfade = false}) async {
     if (_currentTrack == null) return;
     final keepSheet = _sheetController.value > 0.5;
 
@@ -1600,7 +1885,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     } else {
       nextIdx = (curIdx + 1) % _activeAudioQueue.length;
     }
-    await _playTrack(_activeAudioQueue[nextIdx], _activeAudioQueue, openSheet: keepSheet);
+    await _playTrack(
+      _activeAudioQueue[nextIdx],
+      _activeAudioQueue,
+      openSheet: keepSheet,
+      useCrossfade: useCrossfade,
+    );
   }
 
   Future<void> _prevTrack() async {
@@ -1938,8 +2228,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                 } else if (presetName == 'Plano') {
                   _loudnessBoost = 0.0;
                 }
-                await _audioHandler.loudnessEnhancer.setEnabled(_loudnessBoost > 0.01);
-                await _audioHandler.loudnessEnhancer.setTargetGain(_loudnessBoost);
+                await _applySavedEqualizer();
                 setSheetState(() {});
                 _savePrefs();
               } catch (_) {}
@@ -1985,10 +2274,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             onChanged: (v) async {
                               setState(() => _eqEnabled = v);
                               setSheetState(() {});
-                              try {
-                                await _audioHandler.equalizer.setEnabled(v);
-                                await _audioHandler.loudnessEnhancer.setEnabled(v && _loudnessBoost > 0.01);
-                              } catch (_) {}
+                              await _applySavedEqualizer();
                               _savePrefs();
                             },
                           ),
@@ -2077,6 +2363,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                             onChangeEnd: (_) {
                                               _eqSavedGains = List<double>.from(bandValues);
                                               _savePrefs();
+                                              unawaited(_applySavedEqualizer());
                                             },
                                           ),
                                         ),
@@ -2138,7 +2425,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                           await _audioHandler.loudnessEnhancer.setTargetGain(v);
                                         } catch (_) {}
                                       },
-                                onChangeEnd: (_) => _savePrefs(),
+                                onChangeEnd: (_) {
+                                  _savePrefs();
+                                  unawaited(_applySavedEqualizer());
+                                },
                               ),
                             ],
                           ),
@@ -2691,7 +2981,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
               trailing: active ? Icon(Icons.check_rounded, color: _playerAccent) : null,
               onTap: () {
                 setState(() => _speed = s);
-                _audioPlayer.setSpeed(s);
+                _audioHandler.setSpeedLive(s);
                 Navigator.pop(ctx);
               },
             );
@@ -3043,7 +3333,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     ),
                   )
                 : StreamBuilder<Duration>(
-                    stream: _audioPlayer.positionStream,
+                    stream: _audioHandler.unifiedPositionStream,
                     builder: (context, snap) {
                       final pos = snap.data ?? Duration.zero;
                       final activeIdx = LyricsParser.activeIndex(_currentLyrics, pos);
@@ -3361,6 +3651,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final chips = <String>[
       'Todas',
       'Favoritos',
+      if (!isVideo) 'Top',
       ...plNames.map((n) => 'PL::$n'),
       ...folders.take(8),
     ];
@@ -3472,6 +3763,15 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         Text('Favoritos', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: fg)),
                       ],
                     );
+                  } else if (c == 'Top') {
+                    labelWidget = Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.local_fire_department_rounded, size: 14, color: active ? Colors.white : _accent),
+                        const SizedBox(width: 4),
+                        Text('Top', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: fg)),
+                      ],
+                    );
                   } else if (c.startsWith('PL::')) {
                     labelWidget = Row(
                       mainAxisSize: MainAxisSize.min,
@@ -3540,9 +3840,17 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                '${tracks.length} ${isVideo ? 'videos' : 'canciones'}',
+                (!isVideo && filter == 'Top')
+                    ? 'Top ${tracks.length} más escuchadas'
+                    : '${tracks.length} ${isVideo ? 'videos' : 'canciones'}',
                 style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _subtext),
               ),
+              if (!isVideo && filter == 'Top')
+                Text(
+                  'Por reproducciones',
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _accent),
+                )
+              else
               Row(
                 children: [
                   ('recientes', 'Recientes'),
@@ -3595,14 +3903,18 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                           _buildLogoAvatar(82),
                           const SizedBox(height: 14),
                           Text(
-                            _scanning
-                                ? 'Buscando archivos...'
-                                : 'No encontré ${isVideo ? 'videos' : 'canciones'}',
+                            (!isVideo && filter == 'Top')
+                                ? 'Aún no tienes un Top'
+                                : (_scanning
+                                    ? 'Buscando archivos...'
+                                    : 'No encontré ${isVideo ? 'videos' : 'canciones'}'),
                             style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: _text),
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'relaxPlayer lee automáticamente tu Música, Descargas y Videos.',
+                            (!isVideo && filter == 'Top')
+                                ? 'Escucha tus canciones y aquí aparecerán tus más reproducidas.'
+                                : 'relaxPlayer lee automáticamente tu Música, Descargas y Videos.',
                             textAlign: TextAlign.center,
                             style: TextStyle(fontSize: 12, color: _subtext),
                           ),
@@ -3625,6 +3937,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       final t = tracks[i];
                       final isCurrent = _currentTrack?.path == t.path;
                       final isFav = _favorites.contains(t.path);
+                      final isTopView = !isVideo && filter == 'Top';
+                      final playCnt = _trackPlayCounts[t.path] ?? 0;
                       final hasThumb = !isVideo && t.coverPath != null && File(t.coverPath!).existsSync();
 
                       return Padding(
@@ -3640,6 +3954,20 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                               child: Row(
                                 children: [
+                                  if (isTopView)
+                                    Container(
+                                      width: 28,
+                                      alignment: Alignment.center,
+                                      margin: const EdgeInsets.only(right: 6),
+                                      child: Text(
+                                        '#${i + 1}',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w700,
+                                          color: i < 3 ? _accent : _subtext,
+                                        ),
+                                      ),
+                                    ),
                                   hasThumb
                                       ? ClipRRect(
                                           borderRadius: BorderRadius.circular(10),
@@ -3682,7 +4010,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                           ),
                                         ),
                                         Text(
-                                          isVideo ? '${t.folder} / ${t.ext}' : '${t.artist} / ${t.ext}',
+                                          isVideo
+                                              ? '${t.folder} / ${t.ext}'
+                                              : (isTopView
+                                                  ? '${t.artist}  ·  $playCnt ${playCnt == 1 ? 'vez' : 'veces'}'
+                                                  : '${t.artist} / ${t.ext}'),
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                           style: TextStyle(fontSize: 11, color: _subtext),
@@ -3864,6 +4196,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final totalMin = _dailySeconds.values.fold<int>(0, (a, b) => a + b) ~/ 60;
     final nMus = _getList(isVideo: false, onlyPrivate: false).length;
     final nVid = _getList(isVideo: true, onlyPrivate: false).length;
+    final top5 = _getTopTracks(limit: 5);
 
     return ListView(
       padding: EdgeInsets.fromLTRB(16, 12, 16, _bottomScrollClearance),
@@ -3915,6 +4248,194 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     );
                   }).toList(),
                 ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+
+        // Top 5 mas escuchadas (mini ranking personal)
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.local_fire_department_rounded, size: 18, color: _accent),
+                      const SizedBox(width: 6),
+                      Text('Top más escuchadas', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _text)),
+                    ],
+                  ),
+                  if (top5.isNotEmpty)
+                    InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: () {
+                        setState(() {
+                          _musicFilter = 'Top';
+                          _activeTab = 0;
+                        });
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        child: Text('Ver todo', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _accent)),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              if (top5.isEmpty)
+                Text(
+                  'Escucha algunas canciones y aquí aparecerá tu ranking personal.',
+                  style: TextStyle(fontSize: 12, color: _subtext),
+                )
+              else
+                ...List.generate(top5.length, (idx) {
+                  final t = top5[idx];
+                  final cnt = _trackPlayCounts[t.path] ?? 0;
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () => _playTrack(t, _getTopTracks(limit: 25), openSheet: true),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 26,
+                            child: Text(
+                              '#${idx + 1}',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                                color: idx < 3 ? _accent : _subtext,
+                              ),
+                            ),
+                          ),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  t.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text),
+                                ),
+                                Text(
+                                  t.artist,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 11, color: _subtext),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                            decoration: BoxDecoration(
+                              color: withA(_accent, 0.16),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(
+                              '$cnt',
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: _accent),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+
+        // Reproduccion inteligente: Transicion suave (Crossfade) + Pausa al desconectar audifonos
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Pausa al desconectar audífonos', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _text)),
+                        Text('Se detiene sola si quitas el cable o el Bluetooth', style: TextStyle(fontSize: 11, color: _subtext)),
+                      ],
+                    ),
+                  ),
+                  Switch(
+                    value: _autoPauseDisconnect,
+                    onChanged: (v) {
+                      setState(() => _autoPauseDisconnect = v);
+                      _audioHandler.autoPauseOnDisconnect = v;
+                      _savePrefs();
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Transición suave (Crossfade)', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _text)),
+                  Text(
+                    _crossfadeSeconds == 0 ? 'Apagado' : '${_crossfadeSeconds}s',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _accent),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Mezcla el final de una canción con el inicio de la siguiente',
+                style: TextStyle(fontSize: 11, color: _subtext),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [0, 2, 4, 6, 8].map((sec) {
+                  final selected = _crossfadeSeconds == sec;
+                  return Expanded(
+                    child: Padding(
+                      padding: EdgeInsets.only(right: sec == 8 ? 0 : 6),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () {
+                          setState(() => _crossfadeSeconds = sec);
+                          _audioHandler.crossfadeSeconds = sec;
+                          _savePrefs();
+                          _showSnack(sec == 0 ? 'Crossfade desactivado.' : 'Crossfade ajustado a ${sec}s.');
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          decoration: BoxDecoration(
+                            color: selected ? _accent : _surfaceAlt,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          alignment: Alignment.center,
+                          child: Text(
+                            sec == 0 ? 'Off' : '${sec}s',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: selected ? Colors.white : _text,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
               ),
             ],
           ),
@@ -4614,7 +5135,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
                 // Barra de progreso
                 StreamBuilder<Duration>(
-                  stream: _audioPlayer.positionStream,
+                  stream: _audioHandler.unifiedPositionStream,
                   builder: (context, posSnap) {
                     final dur = _audioPlayer.duration ?? Duration.zero;
                     final pos = posSnap.data ?? Duration.zero;
@@ -4701,7 +5222,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       showActiveDot: true,
                       onTap: () {
                         setState(() => _repeat = !_repeat);
-                        _audioPlayer.setLoopMode(_repeat ? LoopMode.one : LoopMode.off);
+                        _audioHandler.setRepeatOne(_repeat);
                         _showSnack(_repeat ? 'Repetir canción activado.' : 'Repetir canción desactivado.');
                       },
                     ),
@@ -4807,7 +5328,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             value: _volume,
                             onChanged: (v) {
                               setState(() => _volume = v);
-                              _audioPlayer.setVolume(v);
+                              _audioHandler.setVolumeLive(v);
                             },
                             onChangeEnd: (_) => _savePrefs(),
                           ),
