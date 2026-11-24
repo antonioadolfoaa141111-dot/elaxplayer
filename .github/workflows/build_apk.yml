@@ -48,6 +48,31 @@ jobs:
           mv lib/main.dart.bak lib/main.dart
           cp android_manifest.xml android/app/src/main/AndroidManifest.xml
 
+          # Desactivar tareas de Android Lint que se traban en plugins como image_picker_android
+          if [ -f android/build.gradle.kts ]; then
+            cat << 'EOF' >> android/build.gradle.kts
+
+          allprojects {
+              tasks.configureEach {
+                  if (name.contains("lint", ignoreCase = true)) {
+                      enabled = false
+                  }
+              }
+          }
+          EOF
+          elif [ -f android/build.gradle ]; then
+            cat << 'EOF' >> android/build.gradle
+
+          allprojects {
+              tasks.configureEach {
+                  if (name.toLowerCase().contains("lint")) {
+                      enabled = false
+                  }
+              }
+          }
+          EOF
+          fi
+
           mkdir -p android/app/src/main/res/drawable
           mkdir -p android/app/src/main/res/raw
 
