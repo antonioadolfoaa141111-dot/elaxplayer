@@ -22,17 +22,40 @@ Future<void> main() async {
     config: const AudioServiceConfig(
       androidNotificationChannelId: 'com.relaxplayer.channel.audio',
       androidNotificationChannelName: 'relaxPlayer',
+      androidNotificationIcon: 'drawable/ic_stat_relax',
       androidNotificationOngoing: false,
       androidStopForegroundOnPause: false,
+      androidShowNotificationBadge: false,
       androidNotificationClickStartsActivity: true,
     ),
   );
   runApp(const RelaxPlayerApp());
 }
 
-// --- Servicio de audio nativo con controles completos en barra de notificaciones ---
+// --- Servicio de audio nativo con botones garantizados en barra de notificaciones ---
 
-class RelaxAudioHandler extends BaseAudioHandler with SeekHandler {
+class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+  static const MediaControl _ctrlPrev = MediaControl(
+    androidIcon: 'drawable/ic_media_prev',
+    label: 'Anterior',
+    action: MediaAction.skipToPrevious,
+  );
+  static const MediaControl _ctrlPause = MediaControl(
+    androidIcon: 'drawable/ic_media_pause',
+    label: 'Pausar',
+    action: MediaAction.pause,
+  );
+  static const MediaControl _ctrlPlay = MediaControl(
+    androidIcon: 'drawable/ic_media_play',
+    label: 'Reproducir',
+    action: MediaAction.play,
+  );
+  static const MediaControl _ctrlNext = MediaControl(
+    androidIcon: 'drawable/ic_media_next',
+    label: 'Siguiente',
+    action: MediaAction.skipToNext,
+  );
+
   final AudioPlayer player = AudioPlayer();
 
   Future<void> Function()? onSkipNext;
@@ -40,6 +63,7 @@ class RelaxAudioHandler extends BaseAudioHandler with SeekHandler {
   Future<void> Function()? onTrackCompleted;
 
   bool _completionSent = false;
+  int _currentQueueIndex = 0;
 
   RelaxAudioHandler() {
     player.playbackEventStream.listen(_broadcastState);
@@ -69,50 +93,46 @@ class RelaxAudioHandler extends BaseAudioHandler with SeekHandler {
     required String artist,
     required String album,
     Uri? artUri,
+    required List<MediaItem> queueItems,
+    required int queueIndex,
     required double volume,
     required double speed,
     required bool repeatOne,
   }) async {
     _completionSent = false;
-    mediaItem.add(
-      MediaItem(
-        id: path,
-        title: title,
-        artist: artist,
-        album: album,
-        artUri: artUri,
-      ),
+    _currentQueueIndex = queueIndex.clamp(0, max(0, queueItems.length - 1));
+
+    final currentItem = MediaItem(
+      id: path,
+      title: title,
+      artist: artist,
+      album: album,
+      artUri: artUri,
     );
+
+    if (queueItems.isNotEmpty) {
+      queue.add(queueItems);
+    } else {
+      queue.add([currentItem]);
+    }
+    mediaItem.add(currentItem);
+
     final dur = await player.setFilePath(path);
     if (dur != null && dur > Duration.zero) {
-      final current = mediaItem.value;
-      if (current != null && current.id == path) {
-        mediaItem.add(current.copyWith(duration: dur));
-      }
+      final updated = currentItem.copyWith(duration: dur);
+      mediaItem.add(updated);
     }
     await player.setVolume(volume);
     await player.setSpeed(speed);
     await player.setLoopMode(repeatOne ? LoopMode.one : LoopMode.off);
-    _broadcastState(player.playbackEvent);
-    await player.play();
-    _broadcastState(player.playbackEvent);
+
+    // No hacer await de player.play() porque en just_audio bloquea hasta terminar la cancion
+    unawaited(player.play());
+    _broadcastState(player.playbackEvent, forcePlaying: true);
   }
 
-  void updateCurrentArtwork(String path, {String? title, String? artist, Uri? artUri}) {
-    final current = mediaItem.value;
-    if (current != null && current.id == path) {
-      mediaItem.add(
-        current.copyWith(
-          title: title ?? current.title,
-          artist: artist ?? current.artist,
-          artUri: artUri ?? current.artUri,
-        ),
-      );
-    }
-  }
-
-  void _broadcastState(PlaybackEvent event) {
-    final playing = player.playing;
+  void _broadcastState(PlaybackEvent event, {bool? forcePlaying}) {
+    final playing = forcePlaying ?? player.playing;
     const stateMap = <ProcessingState, AudioProcessingState>{
       ProcessingState.idle: AudioProcessingState.idle,
       ProcessingState.loading: AudioProcessingState.loading,
@@ -124,9 +144,9 @@ class RelaxAudioHandler extends BaseAudioHandler with SeekHandler {
     playbackState.add(
       playbackState.value.copyWith(
         controls: [
-          MediaControl.skipToPrevious,
-          playing ? MediaControl.pause : MediaControl.play,
-          MediaControl.skipToNext,
+          _ctrlPrev,
+          playing ? _ctrlPause : _ctrlPlay,
+          _ctrlNext,
         ],
         systemActions: const {
           MediaAction.seek,
@@ -140,26 +160,26 @@ class RelaxAudioHandler extends BaseAudioHandler with SeekHandler {
           MediaAction.stop,
         },
         androidCompactActionIndices: const [0, 1, 2],
-        processingState: stateMap[player.processingState] ?? AudioProcessingState.idle,
+        processingState: stateMap[player.processingState] ?? AudioProcessingState.ready,
         playing: playing,
         updatePosition: player.position,
         bufferedPosition: player.bufferedPosition,
         speed: player.speed,
-        queueIndex: 0,
+        queueIndex: _currentQueueIndex,
       ),
     );
   }
 
   @override
   Future<void> play() async {
-    await player.play();
-    _broadcastState(player.playbackEvent);
+    unawaited(player.play());
+    _broadcastState(player.playbackEvent, forcePlaying: true);
   }
 
   @override
   Future<void> pause() async {
     await player.pause();
-    _broadcastState(player.playbackEvent);
+    _broadcastState(player.playbackEvent, forcePlaying: false);
   }
 
   @override
@@ -256,6 +276,47 @@ String parentFolderName(String path) {
   final prevSlash = parent.lastIndexOf('/');
   final name = prevSlash >= 0 ? parent.substring(prevSlash + 1) : parent;
   return name.isEmpty ? 'Dispositivo' : name;
+}
+
+// --- Boton tactil con rebote elastico suave ---
+
+class _SpringPressButton extends StatefulWidget {
+  final Widget child;
+  final VoidCallback onTap;
+  final double pressedScale;
+
+  const _SpringPressButton({
+    required this.child,
+    required this.onTap,
+    this.pressedScale = 0.90,
+  });
+
+  @override
+  State<_SpringPressButton> createState() => _SpringPressButtonState();
+}
+
+class _SpringPressButtonState extends State<_SpringPressButton> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) => setState(() => _pressed = true),
+      onTapUp: (_) {
+        setState(() => _pressed = false);
+        HapticFeedback.lightImpact();
+        widget.onTap();
+      },
+      onTapCancel: () => setState(() => _pressed = false),
+      child: AnimatedScale(
+        scale: _pressed ? widget.pressedScale : 1.0,
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOutBack,
+        child: widget.child,
+      ),
+    );
+  }
 }
 
 class MediaTrack {
@@ -654,7 +715,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   }
 
   void _bindAudioStreams() {
-    // Conectar botones Siguiente / Anterior / Fin de pista de la notificacion
     _audioHandler.onSkipNext = () async {
       await _nextTrack();
     };
@@ -910,7 +970,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     return _sortList(base, sort);
   }
 
-  // --- Reproduccion de audio (con controles completos en notificacion) y video ---
+  // --- Reproduccion de audio (con controles garantizados en notificacion) y video ---
 
   Future<void> _playTrack(MediaTrack track, List<MediaTrack> queue, {bool openSheet = true}) async {
     _totalPlays++;
@@ -950,12 +1010,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       return;
     }
 
-    // Audio nativo con controles Anterior / Play-Pausa / Siguiente en la notificacion
     await _disposeVideo();
     await Id3Reader.loadTrackMetadata(track, _cacheDir);
 
     final validQueue = queue.isEmpty ? [track] : List<MediaTrack>.from(queue);
     _activeAudioQueue = validQueue;
+    final curIdx = max(0, validQueue.indexWhere((t) => t.path == track.path));
 
     if (mounted) {
       setState(() {
@@ -971,12 +1031,27 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           ? Uri.file(track.coverPath!)
           : _defaultLogoUri;
 
+      final mediaQueue = validQueue.map((t) {
+        final Uri? tArt = (t.coverPath != null && File(t.coverPath!).existsSync())
+            ? Uri.file(t.coverPath!)
+            : _defaultLogoUri;
+        return MediaItem(
+          id: t.path,
+          title: t.title,
+          artist: t.artist,
+          album: t.folder,
+          artUri: tArt,
+        );
+      }).toList();
+
       await _audioHandler.playMediaTrack(
         path: track.path,
         title: track.title,
         artist: track.artist,
         album: track.folder,
         artUri: art,
+        queueItems: mediaQueue,
+        queueIndex: curIdx,
         volume: _volume,
         speed: _speed,
         repeatOne: _repeat,
@@ -1287,7 +1362,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Logo y Portada ---
+  // --- Logo y Portada con aura viva ---
 
   Widget _buildLogoAvatar(double size) {
     if (_hasLogoAsset) {
@@ -1321,9 +1396,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   Widget _buildBigCover(MediaTrack? track, double size) {
     final coverFile = (track?.coverPath != null) ? File(track!.coverPath!) : null;
+    Widget inner;
+
     if (coverFile != null && coverFile.existsSync()) {
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(24),
+      inner = ClipRRect(
+        borderRadius: BorderRadius.circular(26),
         child: Image.file(
           coverFile,
           width: size,
@@ -1331,35 +1408,239 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           fit: BoxFit.cover,
         ),
       );
-    }
-    if (_hasLogoAsset) {
-      return Container(
+    } else if (_hasLogoAsset) {
+      inner = Container(
         width: size,
         height: size,
         padding: EdgeInsets.all(size * 0.08),
         decoration: BoxDecoration(
           color: Colors.white,
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(26),
         ),
         child: Image.asset(
           'assets/logo.png',
           fit: BoxFit.contain,
         ),
       );
+    } else {
+      inner = Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(26),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              blendSolid(_accent, _surfaceAlt, 0.16),
+              _surfaceAlt,
+            ],
+          ),
+          border: Border.all(color: withA(Colors.white, widget.darkMode ? 0.12 : 0.6)),
+        ),
+        child: Icon(Icons.headphones_rounded, size: size * 0.36, color: _accent),
+      );
     }
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        color: _surfaceAlt,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: withA(_accent, 0.35)),
+
+    return AnimatedScale(
+      scale: _isPlaying ? 1.0 : 0.93,
+      duration: const Duration(milliseconds: 340),
+      curve: Curves.easeOutCubic,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 360),
+        curve: Curves.easeOutCubic,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(26),
+          boxShadow: [
+            BoxShadow(
+              color: withA(_accent, _isPlaying ? 0.34 : 0.10),
+              blurRadius: _isPlaying ? 34 : 16,
+              spreadRadius: _isPlaying ? -2 : -6,
+              offset: const Offset(0, 14),
+            ),
+            BoxShadow(
+              color: withA(Colors.black, widget.darkMode ? 0.45 : 0.16),
+              blurRadius: 24,
+              offset: const Offset(0, 12),
+            ),
+          ],
+        ),
+        child: inner,
       ),
-      child: Icon(Icons.headphones_rounded, size: size * 0.36, color: _accent),
     );
   }
 
-  // --- Construccion Principal con Dock Liquid Glass flotando sobre la lista ---
+  // --- Controles de reproduccion con vida y acabado Liquid Glass ---
+
+  Widget _buildGlassCircleButton({
+    required IconData icon,
+    required VoidCallback onTap,
+    double size = 50,
+    double iconSize = 26,
+    bool active = false,
+    bool showActiveDot = false,
+  }) {
+    final dark = widget.darkMode;
+    final fg = active
+        ? (dark ? Colors.white : _accent)
+        : (dark ? withA(Colors.white, 0.90) : _text);
+
+    return _SpringPressButton(
+      onTap: onTap,
+      pressedScale: 0.87,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            width: size,
+            height: size,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: active
+                    ? [
+                        withA(_accent, dark ? 0.42 : 0.28),
+                        withA(_accent, dark ? 0.18 : 0.12),
+                      ]
+                    : (dark
+                        ? [
+                            withA(Colors.white, 0.14),
+                            withA(Colors.white, 0.04),
+                          ]
+                        : [
+                            withA(Colors.white, 0.90),
+                            withA(Colors.white, 0.55),
+                          ]),
+              ),
+              border: Border.all(
+                color: active
+                    ? withA(_accent, 0.65)
+                    : (dark ? withA(Colors.white, 0.18) : withA(Colors.black, 0.08)),
+                width: 1.15,
+              ),
+              boxShadow: [
+                if (active)
+                  BoxShadow(
+                    color: withA(_accent, 0.34),
+                    blurRadius: 16,
+                    spreadRadius: -2,
+                  ),
+                BoxShadow(
+                  color: withA(Colors.black, dark ? 0.28 : 0.08),
+                  blurRadius: 12,
+                  offset: const Offset(0, 5),
+                ),
+              ],
+            ),
+            child: Icon(icon, size: iconSize, color: fg),
+          ),
+          if (showActiveDot) ...[
+            const SizedBox(height: 5),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              width: active ? 5 : 0,
+              height: active ? 5 : 0,
+              decoration: BoxDecoration(
+                color: _accent,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(color: withA(_accent, 0.7), blurRadius: 6),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeroPlayPauseOrb({double size = 74, double iconSize = 38}) {
+    final lightTint = Color.lerp(_accent, Colors.white, 0.34) ?? _accent;
+    final deepTint = Color.lerp(_accent, Colors.black, 0.24) ?? _accent;
+
+    return _SpringPressButton(
+      onTap: _togglePlayPause,
+      pressedScale: 0.90,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            stops: const [0.0, 0.42, 1.0],
+            colors: [lightTint, _accent, deepTint],
+          ),
+          border: Border.all(
+            color: withA(Colors.white, 0.45),
+            width: 1.4,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: withA(_accent, _isPlaying ? 0.62 : 0.34),
+              blurRadius: _isPlaying ? 28 : 16,
+              spreadRadius: _isPlaying ? 1 : -2,
+              offset: const Offset(0, 8),
+            ),
+            BoxShadow(
+              color: withA(Colors.black, 0.32),
+              blurRadius: 16,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            // Reflejo cristalino superior tipo Liquid Glass
+            Positioned(
+              top: 4,
+              left: size * 0.20,
+              right: size * 0.20,
+              height: size * 0.28,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(size),
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      withA(Colors.white, 0.38),
+                      Colors.transparent,
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            // Icono Play / Pausa con transicion elastica
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              switchInCurve: Curves.easeOutBack,
+              switchOutCurve: Curves.easeIn,
+              transitionBuilder: (child, anim) => ScaleTransition(
+                scale: Tween<double>(begin: 0.65, end: 1.0).animate(anim),
+                child: FadeTransition(opacity: anim, child: child),
+              ),
+              child: Icon(
+                _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                key: ValueKey<bool>(_isPlaying),
+                color: Colors.white,
+                size: iconSize,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --- Construccion Principal con Dock Liquid Glass flotante ---
 
   @override
   Widget build(BuildContext context) {
@@ -1380,13 +1661,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             backgroundColor: _bg,
             body: Stack(
               children: [
-                // Capa 1: Contenido a pantalla completa (las canciones pasan detras del vidrio liquido)
                 SafeArea(
                   bottom: false,
                   child: _buildActiveTabBody(),
                 ),
 
-                // Capa 2: Mini reproductor esmerilado + Barra inferior estilo Liquid Glass flotante
                 Positioned(
                   left: 14,
                   right: 14,
@@ -1401,7 +1680,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ),
                 ),
 
-                // Capa 3: Reproductor pantalla completa (100% opaco, subida y bajada fluida)
                 if (_currentTrack != null && _sheetController.value > 0.0)
                   FractionalTranslation(
                     translation: Offset(0, 1.0 - _sheetController.value),
@@ -2156,7 +2434,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             child: InkWell(
               onTap: _openPlayerSheet,
               child: Container(
-                padding: const EdgeInsets.fromLTRB(10, 7, 4, 7),
+                padding: const EdgeInsets.fromLTRB(10, 7, 8, 7),
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(22),
                   gradient: LinearGradient(
@@ -2202,13 +2480,44 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         ],
                       ),
                     ),
-                    IconButton(
-                      icon: Icon(_isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, color: _text, size: 26),
-                      onPressed: _togglePlayPause,
+                    _SpringPressButton(
+                      onTap: _togglePlayPause,
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [
+                              Color.lerp(_accent, Colors.white, 0.22) ?? _accent,
+                              _accent,
+                            ],
+                          ),
+                          boxShadow: [
+                            BoxShadow(color: withA(_accent, 0.40), blurRadius: 10),
+                          ],
+                        ),
+                        child: Icon(
+                          _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                          color: Colors.white,
+                          size: 21,
+                        ),
+                      ),
                     ),
-                    IconButton(
-                      icon: Icon(Icons.skip_next_rounded, color: _subtext, size: 24),
-                      onPressed: _nextTrack,
+                    const SizedBox(width: 6),
+                    _SpringPressButton(
+                      onTap: _nextTrack,
+                      child: Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: dark ? withA(Colors.white, 0.10) : withA(Colors.black, 0.06),
+                        ),
+                        child: Icon(Icons.skip_next_rounded, color: _text, size: 20),
+                      ),
                     ),
                   ],
                 ),
@@ -2220,7 +2529,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Barra de navegacion inferior estilo LIQUID GLASS (capsula flotante + gota deslizante) ---
+  // --- Barra de navegacion inferior estilo LIQUID GLASS ---
 
   Widget _buildLiquidGlassBottomNav() {
     final dark = widget.darkMode;
@@ -2284,7 +2593,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
                 return Stack(
                   children: [
-                    // Brillo especular superior que simula la curvatura del vidrio liquido
                     Positioned(
                       top: 0,
                       left: 24,
@@ -2303,7 +2611,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       ),
                     ),
 
-                    // Gota / burbuja de vidrio liquido que se desliza suavemente entre pestanas
                     AnimatedPositioned(
                       duration: const Duration(milliseconds: 300),
                       curve: Curves.easeOutCubic,
@@ -2342,7 +2649,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       ),
                     ),
 
-                    // Botones de navegacion
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: padH),
                       child: Row(
@@ -2399,15 +2705,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Pantalla completa del Reproductor de Musica (100% opaca + deslizamiento interactivo) ---
+  // --- Pantalla completa del Reproductor de Musica ---
 
   Widget _buildMusicPlayerSheet() {
     final track = _currentTrack!;
     final isFav = _favorites.contains(track.path);
-    final topSolid = blendSolid(_accent, _bg, 0.30);
+    final topSolid = blendSolid(_accent, _bg, 0.32);
     final screenH = MediaQuery.of(context).size.height;
     final screenW = MediaQuery.of(context).size.width;
-    final coverSize = min(310.0, min(screenW * 0.74, screenH * 0.35));
+    final coverSize = min(305.0, min(screenW * 0.72, screenH * 0.34));
+    final dark = widget.darkMode;
 
     return GestureDetector(
       onVerticalDragUpdate: (details) {
@@ -2428,7 +2735,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
-            end: const Alignment(0, 0.72),
+            end: const Alignment(0, 0.76),
             colors: [topSolid, _bg],
           ),
         ),
@@ -2452,13 +2759,15 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        IconButton(
-                          icon: Icon(Icons.keyboard_arrow_down_rounded, size: 30, color: _text),
-                          onPressed: _closePlayerSheet,
+                        _buildGlassCircleButton(
+                          icon: Icons.keyboard_arrow_down_rounded,
+                          size: 40,
+                          iconSize: 26,
+                          onTap: _closePlayerSheet,
                         ),
                         Column(
                           children: [
-                            Text('REPRODUCIENDO', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, color: _subtext)),
+                            Text('REPRODUCIENDO', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, letterSpacing: 1.2, color: _subtext)),
                             Text('relaxPlayer', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text)),
                           ],
                         ),
@@ -2467,19 +2776,18 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                           children: [
                             if (_sleepRemainingSec > 0)
                               Padding(
-                                padding: const EdgeInsets.only(right: 4),
+                                padding: const EdgeInsets.only(right: 6),
                                 child: Text(
                                   formatTime(Duration(seconds: _sleepRemainingSec)),
                                   style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _accent),
                                 ),
                               ),
-                            IconButton(
-                              icon: Icon(
-                                Icons.bedtime_outlined,
-                                size: 22,
-                                color: _sleepRemainingSec > 0 ? _accent : _subtext,
-                              ),
-                              onPressed: _showSleepTimerDialog,
+                            _buildGlassCircleButton(
+                              icon: Icons.bedtime_outlined,
+                              size: 40,
+                              iconSize: 20,
+                              active: _sleepRemainingSec > 0,
+                              onTap: _showSleepTimerDialog,
                             ),
                           ],
                         ),
@@ -2512,17 +2820,20 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         ],
                       ),
                     ),
-                    IconButton(
-                      icon: Icon(Icons.playlist_add_rounded, size: 24, color: _subtext),
-                      onPressed: () => _showAddToPlaylistDialog(track.path),
+                    const SizedBox(width: 8),
+                    _buildGlassCircleButton(
+                      icon: Icons.playlist_add_rounded,
+                      size: 40,
+                      iconSize: 21,
+                      onTap: () => _showAddToPlaylistDialog(track.path),
                     ),
-                    IconButton(
-                      icon: Icon(
-                        isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                        size: 24,
-                        color: isFav ? _accent : _subtext,
-                      ),
-                      onPressed: () => _toggleFavorite(track.path),
+                    const SizedBox(width: 8),
+                    _buildGlassCircleButton(
+                      icon: isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                      size: 40,
+                      iconSize: 20,
+                      active: isFav,
+                      onTap: () => _toggleFavorite(track.path),
                     ),
                   ],
                 ),
@@ -2539,12 +2850,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       children: [
                         SliderTheme(
                           data: SliderTheme.of(context).copyWith(
-                            trackHeight: 4,
-                            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                            trackHeight: 4.5,
+                            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7.5),
                             activeTrackColor: _accent,
-                            inactiveTrackColor: _border,
-                            thumbColor: _text,
-                            overlayColor: withA(_accent, 0.2),
+                            inactiveTrackColor: dark ? withA(Colors.white, 0.14) : _border,
+                            thumbColor: Colors.white,
+                            overlayColor: withA(_accent, 0.24),
                           ),
                           child: Slider(
                             min: 0.0,
@@ -2578,41 +2889,42 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   },
                 ),
 
+                // Fila renovada de controles principales con profundidad, brillo y rebote elastico
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
-                    IconButton(
-                      icon: Icon(Icons.shuffle_rounded, size: 23, color: _shuffle ? _accent : _subtext),
-                      onPressed: () {
+                    _buildGlassCircleButton(
+                      icon: Icons.shuffle_rounded,
+                      size: 42,
+                      iconSize: 20,
+                      active: _shuffle,
+                      showActiveDot: true,
+                      onTap: () {
                         setState(() => _shuffle = !_shuffle);
                         _showSnack(_shuffle ? 'Modo aleatorio activado.' : 'Modo aleatorio desactivado.');
                       },
                     ),
-                    IconButton(
-                      icon: Icon(Icons.skip_previous_rounded, size: 36, color: _text),
-                      onPressed: _prevTrack,
+                    _buildGlassCircleButton(
+                      icon: Icons.skip_previous_rounded,
+                      size: 52,
+                      iconSize: 28,
+                      onTap: _prevTrack,
                     ),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(34),
-                      onTap: _togglePlayPause,
-                      child: Container(
-                        width: 66,
-                        height: 66,
-                        decoration: BoxDecoration(color: _accent, shape: BoxShape.circle),
-                        child: Icon(
-                          _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                          color: Colors.white,
-                          size: 36,
-                        ),
-                      ),
+                    _buildHeroPlayPauseOrb(size: 74, iconSize: 38),
+                    _buildGlassCircleButton(
+                      icon: Icons.skip_next_rounded,
+                      size: 52,
+                      iconSize: 28,
+                      onTap: _nextTrack,
                     ),
-                    IconButton(
-                      icon: Icon(Icons.skip_next_rounded, size: 36, color: _text),
-                      onPressed: _nextTrack,
-                    ),
-                    IconButton(
-                      icon: Icon(Icons.repeat_rounded, size: 23, color: _repeat ? _accent : _subtext),
-                      onPressed: () {
+                    _buildGlassCircleButton(
+                      icon: Icons.repeat_rounded,
+                      size: 42,
+                      iconSize: 20,
+                      active: _repeat,
+                      showActiveDot: true,
+                      onTap: () {
                         setState(() => _repeat = !_repeat);
                         _audioPlayer.setLoopMode(_repeat ? LoopMode.one : LoopMode.off);
                         _showSnack(_repeat ? 'Repetir canción activado.' : 'Repetir canción desactivado.');
@@ -2621,63 +2933,89 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ],
                 ),
 
-                Row(
-                  children: [
-                    InkWell(
-                      borderRadius: BorderRadius.circular(14),
-                      onTap: _showSpeedDialog,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: _surfaceAlt,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: _border),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.speed_rounded, size: 14, color: _accent),
-                            const SizedBox(width: 4),
-                            Text(
-                              '${_speed == _speed.roundToDouble() ? _speed.toInt() : _speed}x',
-                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _text),
-                            ),
-                          ],
+                // Capsula cristalina de velocidad + volumen en vivo
+                Container(
+                  padding: const EdgeInsets.fromLTRB(8, 5, 12, 5),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(22),
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: dark
+                          ? [
+                              withA(Colors.white, 0.10),
+                              withA(Colors.white, 0.03),
+                            ]
+                          : [
+                              withA(Colors.white, 0.85),
+                              withA(Colors.white, 0.55),
+                            ],
+                    ),
+                    border: Border.all(
+                      color: dark ? withA(Colors.white, 0.14) : withA(Colors.black, 0.06),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      _SpringPressButton(
+                        onTap: _showSpeedDialog,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: withA(_accent, dark ? 0.22 : 0.14),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: withA(_accent, 0.35)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.speed_rounded, size: 14, color: _accent),
+                              const SizedBox(width: 4),
+                              Text(
+                                '${_speed == _speed.roundToDouble() ? _speed.toInt() : _speed}x',
+                                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _text),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Icon(Icons.volume_down_rounded, size: 19, color: _subtext),
-                    Expanded(
-                      child: SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 4,
-                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
-                          activeTrackColor: _accent,
-                          inactiveTrackColor: _border,
-                          thumbColor: _accent,
-                        ),
-                        child: Slider(
-                          min: 0.0,
-                          max: 1.0,
-                          value: _volume,
-                          onChanged: (v) {
-                            setState(() => _volume = v);
-                            _audioPlayer.setVolume(v);
-                          },
-                          onChangeEnd: (_) => _savePrefs(),
+                      const SizedBox(width: 8),
+                      Icon(
+                        _volume <= 0.01 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                        size: 18,
+                        color: _subtext,
+                      ),
+                      Expanded(
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 4,
+                            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                            activeTrackColor: _accent,
+                            inactiveTrackColor: dark ? withA(Colors.white, 0.14) : _border,
+                            thumbColor: _accent,
+                          ),
+                          child: Slider(
+                            min: 0.0,
+                            max: 1.0,
+                            value: _volume,
+                            onChanged: (v) {
+                              setState(() => _volume = v);
+                              _audioPlayer.setVolume(v);
+                            },
+                            onChangeEnd: (_) => _savePrefs(),
+                          ),
                         ),
                       ),
-                    ),
-                    SizedBox(
-                      width: 36,
-                      child: Text(
-                        '${(_volume * 100).round()}%',
-                        textAlign: TextAlign.right,
-                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _subtext),
+                      SizedBox(
+                        width: 36,
+                        child: Text(
+                          '${(_volume * 100).round()}%',
+                          textAlign: TextAlign.right,
+                          style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _subtext),
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ],
             ),
@@ -2703,10 +3041,13 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           children: [
             Row(
               children: [
-                IconButton(
-                  icon: Icon(Icons.arrow_back_rounded, color: _text),
-                  onPressed: _closePlayerSheet,
+                _buildGlassCircleButton(
+                  icon: Icons.arrow_back_rounded,
+                  size: 40,
+                  iconSize: 22,
+                  onTap: _closePlayerSheet,
                 ),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Text(
                     track.title,
@@ -2715,26 +3056,26 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: _text),
                   ),
                 ),
-                IconButton(
-                  icon: Icon(
-                    isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                    color: isFav ? _accent : _subtext,
-                  ),
-                  onPressed: () => _toggleFavorite(track.path),
+                _buildGlassCircleButton(
+                  icon: isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                  size: 40,
+                  iconSize: 20,
+                  active: isFav,
+                  onTap: () => _toggleFavorite(track.path),
                 ),
               ],
             ),
-            const SizedBox(height: 6),
+            const SizedBox(height: 8),
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
                   color: Colors.black,
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: BorderRadius.circular(18),
                 ),
                 alignment: Alignment.center,
                 child: initialized
                     ? ClipRRect(
-                        borderRadius: BorderRadius.circular(16),
+                        borderRadius: BorderRadius.circular(18),
                         child: AspectRatio(
                           aspectRatio: vc.value.aspectRatio > 0 ? vc.value.aspectRatio : 16 / 9,
                           child: VideoPlayer(vc),
@@ -2754,51 +3095,46 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   backgroundColor: _border,
                 ),
               ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 12),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                IconButton(
-                  icon: Icon(Icons.skip_previous_rounded, size: 32, color: _text),
-                  onPressed: _prevTrack,
+                _buildGlassCircleButton(
+                  icon: Icons.skip_previous_rounded,
+                  size: 46,
+                  iconSize: 26,
+                  onTap: _prevTrack,
                 ),
-                IconButton(
-                  icon: Icon(Icons.replay_10_rounded, size: 28, color: _subtext),
-                  onPressed: () {
+                _buildGlassCircleButton(
+                  icon: Icons.replay_10_rounded,
+                  size: 42,
+                  iconSize: 22,
+                  onTap: () {
                     if (!initialized) return;
                     final target = vc.value.position - const Duration(seconds: 10);
                     vc.seekTo(target < Duration.zero ? Duration.zero : target);
                   },
                 ),
-                InkWell(
-                  borderRadius: BorderRadius.circular(30),
-                  onTap: _togglePlayPause,
-                  child: Container(
-                    width: 58,
-                    height: 58,
-                    decoration: BoxDecoration(color: _accent, shape: BoxShape.circle),
-                    child: Icon(
-                      _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                      color: Colors.white,
-                      size: 32,
-                    ),
-                  ),
-                ),
-                IconButton(
-                  icon: Icon(Icons.forward_10_rounded, size: 28, color: _subtext),
-                  onPressed: () {
+                _buildHeroPlayPauseOrb(size: 64, iconSize: 34),
+                _buildGlassCircleButton(
+                  icon: Icons.forward_10_rounded,
+                  size: 42,
+                  iconSize: 22,
+                  onTap: () {
                     if (!initialized) return;
                     final target = vc.value.position + const Duration(seconds: 10);
                     vc.seekTo(target > vc.value.duration ? vc.value.duration : target);
                   },
                 ),
-                IconButton(
-                  icon: Icon(Icons.skip_next_rounded, size: 32, color: _text),
-                  onPressed: _nextTrack,
+                _buildGlassCircleButton(
+                  icon: Icons.skip_next_rounded,
+                  size: 46,
+                  iconSize: 26,
+                  onTap: _nextTrack,
                 ),
               ],
             ),
-            const SizedBox(height: 6),
+            const SizedBox(height: 8),
             Row(
               children: [
                 Icon(Icons.volume_down_rounded, size: 19, color: _subtext),
