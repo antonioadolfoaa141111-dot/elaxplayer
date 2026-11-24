@@ -525,6 +525,30 @@ class MediaTrack {
     this.coverPath,
     this.metadataLoaded = false,
   });
+
+  Map<String, dynamic> toJson() => {
+        'path': path,
+        'title': title,
+        'artist': artist,
+        'folder': folder,
+        'ext': ext,
+        'isVideo': isVideo,
+        'modifiedMs': modifiedMs,
+        'coverPath': coverPath,
+        'metadataLoaded': metadataLoaded,
+      };
+
+  factory MediaTrack.fromJson(Map<String, dynamic> json) => MediaTrack(
+        path: json['path']?.toString() ?? '',
+        title: json['title']?.toString() ?? '',
+        artist: json['artist']?.toString() ?? 'Dispositivo',
+        folder: json['folder']?.toString() ?? 'Dispositivo',
+        ext: json['ext']?.toString() ?? '',
+        isVideo: json['isVideo'] == true,
+        modifiedMs: (json['modifiedMs'] as num?)?.toInt() ?? 0,
+        coverPath: json['coverPath']?.toString(),
+        metadataLoaded: json['metadataLoaded'] == true,
+      );
 }
 
 // --- Lector nativo en Dart puro de portadas y etiquetas ID3v2 (MP3) ---
@@ -865,10 +889,43 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     _docsDir = docs.path;
     await _prepareLogoAsset();
     await _loadPrefs();
-    await _applySavedEqualizer();
     _bindAudioStreams();
     _startClockTimer();
-    await _scanDeviceMedia(showToast: false);
+    await _loadCachedLibrary();
+    // Escanear en segundo plano sin bloquear el arranque ni borrar la lista guardada
+    unawaited(_scanDeviceMedia(showToast: false));
+  }
+
+  Future<void> _loadCachedLibrary() async {
+    if (_docsDir.isEmpty) return;
+    try {
+      final cacheFile = File('$_docsDir/library_cache.json');
+      if (!await cacheFile.exists()) return;
+      final raw = await cacheFile.readAsString();
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      final loaded = <MediaTrack>[];
+      for (final item in decoded) {
+        if (item is Map<String, dynamic>) {
+          final track = MediaTrack.fromJson(item);
+          if (track.path.isNotEmpty) {
+            _applyOverrideToTrack(track);
+            loaded.add(track);
+          }
+        }
+      }
+      if (loaded.isNotEmpty && mounted) {
+        setState(() => _allTracks = loaded);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveCachedLibrary(List<MediaTrack> tracks) async {
+    if (_docsDir.isEmpty) return;
+    try {
+      final cacheFile = File('$_docsDir/library_cache.json');
+      final encoded = jsonEncode(tracks.map((t) => t.toJson()).toList());
+      await cacheFile.writeAsString(encoded, flush: true);
+    } catch (_) {}
   }
 
   Future<void> _prepareLogoAsset() async {
@@ -994,7 +1051,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       await _audioHandler.loudnessEnhancer.setEnabled(_eqEnabled && _loudnessBoost > 0.01);
       await _audioHandler.loudnessEnhancer.setTargetGain(_loudnessBoost);
       if (_eqSavedGains.isNotEmpty) {
-        final params = await _audioHandler.equalizer.parameters;
+        final params = await _audioHandler.equalizer.parameters.timeout(
+          const Duration(seconds: 2),
+        );
         for (int i = 0; i < params.bands.length && i < _eqSavedGains.length; i++) {
           final clamped = _eqSavedGains[i].clamp(params.minDecibels, params.maxDecibels);
           await params.bands[i].setGain(clamped);
@@ -1150,12 +1209,21 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   // --- Permisos y escaneo automatico ---
 
-  Future<void> _requestAndroidPermissions() async {
+  Future<void> _requestAndroidPermissions({bool promptIfMissing = true}) async {
     if (!Platform.isAndroid) return;
-    await Permission.notification.request();
-    await Permission.audio.request();
-    await Permission.videos.request();
-    await Permission.storage.request();
+    for (final perm in [
+      Permission.notification,
+      Permission.audio,
+      Permission.videos,
+      Permission.storage,
+    ]) {
+      try {
+        final st = await perm.status;
+        if (!st.isGranted && promptIfMissing) {
+          await perm.request();
+        }
+      } catch (_) {}
+    }
   }
 
   Future<void> _scanDeviceMedia({bool showToast = true}) async {
@@ -1163,27 +1231,44 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     setState(() => _scanning = true);
     if (showToast) _showSnack('Actualizando música y videos...');
 
-    await _requestAndroidPermissions();
+    await _requestAndroidPermissions(promptIfMissing: showToast || _allTracks.isEmpty);
 
     List<MediaTrack> found = await _walkMediaDirectories();
 
     if (found.isEmpty && Platform.isAndroid) {
       final manageStatus = await Permission.manageExternalStorage.status;
-      if (!manageStatus.isGranted) {
+      if (!manageStatus.isGranted && (showToast || _allTracks.isEmpty)) {
         await Permission.manageExternalStorage.request();
         found = await _walkMediaDirectories();
       }
     }
 
+    // Preservar metadatos ya leidos de la cache para no perder portadas/titulos
+    final prevByPath = {for (final t in _allTracks) t.path: t};
     for (final t in found) {
+      final prev = prevByPath[t.path];
+      if (prev != null) {
+        if (prev.metadataLoaded) {
+          t.title = prev.title;
+          t.artist = prev.artist;
+          t.coverPath = prev.coverPath;
+          t.metadataLoaded = true;
+        }
+      }
       _applyOverrideToTrack(t);
     }
 
     if (!mounted) return;
-    setState(() {
-      _allTracks = found;
-      _scanning = false;
-    });
+    // Si es un escaneo silencioso al arrancar y devolvio vacio pero ya tenemos cache, no borrar la lista
+    if (found.isNotEmpty || showToast) {
+      setState(() {
+        _allTracks = found;
+        _scanning = false;
+      });
+      unawaited(_saveCachedLibrary(found));
+    } else {
+      setState(() => _scanning = false);
+    }
 
     if (showToast) {
       final nMus = _getList(isVideo: false, onlyPrivate: false).length;
@@ -1380,8 +1465,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
     await _exitVideoFullscreen();
     await _disposeVideo();
+    final hadMeta = track.metadataLoaded;
     await Id3Reader.loadTrackMetadata(track, _cacheDir);
     _applyOverrideToTrack(track);
+    if (!hadMeta && track.metadataLoaded && _allTracks.isNotEmpty) {
+      unawaited(_saveCachedLibrary(_allTracks));
+    }
 
     final validQueue = queue.isEmpty ? [track] : List<MediaTrack>.from(queue);
     _activeAudioQueue = validQueue;
@@ -2233,6 +2322,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                     };
                                   });
                                   await _savePrefs();
+                                  unawaited(_saveCachedLibrary(_allTracks));
                                   if (_currentTrack?.path == track.path) {
                                     final Uri? art = (track.coverPath != null && File(track.coverPath!).existsSync())
                                         ? Uri.file(track.coverPath!)
