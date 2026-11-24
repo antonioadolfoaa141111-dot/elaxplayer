@@ -2,11 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui';
+import 'dart:ui' as ui;
 
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -32,7 +33,7 @@ Future<void> main() async {
   runApp(const RelaxPlayerApp());
 }
 
-// --- Servicio de audio nativo con botones garantizados en barra de notificaciones ---
+// --- Servicio de audio nativo + Ecualizador Android + Refuerzo de bajos ---
 
 class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   static const MediaControl _ctrlPrev = MediaControl(
@@ -56,7 +57,14 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     action: MediaAction.skipToNext,
   );
 
-  final AudioPlayer player = AudioPlayer();
+  final AndroidEqualizer equalizer = AndroidEqualizer();
+  final AndroidLoudnessEnhancer loudnessEnhancer = AndroidLoudnessEnhancer();
+
+  late final AudioPlayer player = AudioPlayer(
+    audioPipeline: Platform.isAndroid
+        ? AudioPipeline(androidAudioEffects: [loudnessEnhancer, equalizer])
+        : null,
+  );
 
   Future<void> Function()? onSkipNext;
   Future<void> Function()? onSkipPrevious;
@@ -119,16 +127,27 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
     final dur = await player.setFilePath(path);
     if (dur != null && dur > Duration.zero) {
-      final updated = currentItem.copyWith(duration: dur);
-      mediaItem.add(updated);
+      mediaItem.add(currentItem.copyWith(duration: dur));
     }
     await player.setVolume(volume);
     await player.setSpeed(speed);
     await player.setLoopMode(repeatOne ? LoopMode.one : LoopMode.off);
 
-    // No hacer await de player.play() porque en just_audio bloquea hasta terminar la cancion
     unawaited(player.play());
     _broadcastState(player.playbackEvent, forcePlaying: true);
+  }
+
+  void updateCurrentMetadata(String path, {String? title, String? artist, Uri? artUri}) {
+    final current = mediaItem.value;
+    if (current != null && current.id == path) {
+      mediaItem.add(
+        current.copyWith(
+          title: title ?? current.title,
+          artist: artist ?? current.artist,
+          artUri: artUri ?? current.artUri,
+        ),
+      );
+    }
   }
 
   void _broadcastState(PlaybackEvent event, {bool? forcePlaying}) {
@@ -227,6 +246,14 @@ const Map<String, Color> kAccentThemes = {
   'Rosa': Color(0xFFF15BB5),
 };
 
+const Map<String, List<double>> kEqPresets = {
+  'Plano': [0.0, 0.0, 0.0, 0.0, 0.0],
+  'Bass Boost': [0.85, 0.55, 0.05, 0.15, 0.25],
+  'Urbano': [0.75, 0.45, -0.05, 0.35, 0.55],
+  'Noche': [0.35, 0.25, 0.12, -0.15, -0.25],
+  'Vocal': [-0.20, 0.10, 0.55, 0.45, 0.15],
+};
+
 const List<double> kSpeedOptions = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const List<String> kWeekDays = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];
 
@@ -254,6 +281,14 @@ String formatTime(Duration d) {
   return '$mins:${secs.toString().padLeft(2, '0')}';
 }
 
+String formatFrequency(double hz) {
+  if (hz >= 1000) {
+    final k = hz / 1000.0;
+    return k == k.roundToDouble() ? '${k.toInt()}k' : '${k.toStringAsFixed(1)}k';
+  }
+  return '${hz.round()}Hz';
+}
+
 String fileExtension(String path) {
   final dot = path.lastIndexOf('.');
   if (dot < 0 || dot == path.length - 1) return '';
@@ -276,6 +311,155 @@ String parentFolderName(String path) {
   final prevSlash = parent.lastIndexOf('/');
   final name = prevSlash >= 0 ? parent.substring(prevSlash + 1) : parent;
   return name.isEmpty ? 'Dispositivo' : name;
+}
+
+String pathWithoutExtension(String path) {
+  final dot = path.lastIndexOf('.');
+  final slash = max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  if (dot > slash) return path.substring(0, dot);
+  return path;
+}
+
+// --- Extractor de color dominante puro en Dart (Colores Camaleon sin paquetes extra) ---
+
+class CoverColorExtractor {
+  static final Map<String, Color> _cache = {};
+
+  static Future<Color?> extractDominant(String imagePath) async {
+    if (_cache.containsKey(imagePath)) return _cache[imagePath];
+    try {
+      final file = File(imagePath);
+      if (!await file.exists()) return null;
+      final bytes = await file.readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes, targetWidth: 24, targetHeight: 24);
+      final frame = await codec.getNextFrame();
+      final bd = await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      frame.image.dispose();
+      codec.dispose();
+      if (bd == null) return null;
+
+      final data = bd.buffer.asUint8List();
+      final bucketWeight = List<double>.filled(12, 0.0);
+      final bucketR = List<double>.filled(12, 0.0);
+      final bucketG = List<double>.filled(12, 0.0);
+      final bucketB = List<double>.filled(12, 0.0);
+
+      for (int i = 0; i + 3 < data.length; i += 4) {
+        final a = data[i + 3];
+        if (a < 180) continue;
+        final r = data[i];
+        final g = data[i + 1];
+        final b = data[i + 2];
+        final hsl = HSLColor.fromColor(Color.fromARGB(255, r, g, b));
+        if (hsl.lightness < 0.12 || hsl.lightness > 0.88 || hsl.saturation < 0.16) {
+          continue;
+        }
+        final score = (hsl.saturation * hsl.saturation) * (1.0 - (hsl.lightness - 0.5).abs());
+        final idx = ((hsl.hue / 30.0).floor()) % 12;
+        bucketWeight[idx] += score;
+        bucketR[idx] += r * score;
+        bucketG[idx] += g * score;
+        bucketB[idx] += b * score;
+      }
+
+      int bestIdx = -1;
+      double bestW = 0.0;
+      for (int i = 0; i < 12; i++) {
+        if (bucketWeight[i] > bestW) {
+          bestW = bucketWeight[i];
+          bestIdx = i;
+        }
+      }
+      if (bestIdx < 0 || bestW <= 0) return null;
+
+      final avgColor = Color.fromARGB(
+        255,
+        (bucketR[bestIdx] / bestW).round().clamp(0, 255),
+        (bucketG[bestIdx] / bestW).round().clamp(0, 255),
+        (bucketB[bestIdx] / bestW).round().clamp(0, 255),
+      );
+      final normalized = HSLColor.fromColor(avgColor);
+      final vibrant = normalized
+          .withSaturation(normalized.saturation.clamp(0.48, 0.84))
+          .withLightness(normalized.lightness.clamp(0.44, 0.58))
+          .toColor();
+
+      if (_cache.length > 60) _cache.clear();
+      _cache[imagePath] = vibrant;
+      return vibrant;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static void invalidate(String imagePath) {
+    _cache.remove(imagePath);
+  }
+}
+
+// --- Parser de letras sincronizadas (.lrc) y texto plano ---
+
+class LyricLine {
+  final Duration? time;
+  final String text;
+
+  const LyricLine({this.time, required this.text});
+}
+
+class LyricsParser {
+  static final RegExp _tagRegex = RegExp(r'\[(\d{1,2}):(\d{2})(?:[\.:](\d{1,3}))?\]');
+
+  static List<LyricLine> parse(String raw) {
+    final lines = <LyricLine>[];
+    bool hasTimestamps = false;
+
+    for (final rawLine in raw.split('\n')) {
+      final trimmed = rawLine.trim();
+      if (trimmed.isEmpty) continue;
+      final matches = _tagRegex.allMatches(trimmed).toList();
+      if (matches.isNotEmpty) {
+        hasTimestamps = true;
+        final text = trimmed.replaceAll(_tagRegex, '').trim();
+        if (text.isEmpty) continue;
+        for (final m in matches) {
+          final mins = int.tryParse(m.group(1) ?? '0') ?? 0;
+          final secs = int.tryParse(m.group(2) ?? '0') ?? 0;
+          final fracStr = m.group(3) ?? '0';
+          int ms = int.tryParse(fracStr) ?? 0;
+          if (fracStr.length == 1) ms *= 100;
+          if (fracStr.length == 2) ms *= 10;
+          lines.add(
+            LyricLine(
+              time: Duration(minutes: mins, seconds: secs, milliseconds: ms),
+              text: text,
+            ),
+          );
+        }
+      } else {
+        // Ignorar etiquetas meta [ar:...], [ti:...]
+        if (trimmed.startsWith('[') && trimmed.endsWith(']') && trimmed.contains(':')) {
+          continue;
+        }
+        lines.add(LyricLine(text: trimmed));
+      }
+    }
+
+    if (hasTimestamps) {
+      lines.sort((a, b) => (a.time ?? Duration.zero).compareTo(b.time ?? Duration.zero));
+    }
+    return lines;
+  }
+
+  static int activeIndex(List<LyricLine> lines, Duration pos) {
+    int idx = -1;
+    for (int i = 0; i < lines.length; i++) {
+      final t = lines[i].time;
+      if (t != null && t <= pos + const Duration(milliseconds: 220)) {
+        idx = i;
+      }
+    }
+    return idx;
+  }
 }
 
 // --- Boton tactil con rebote elastico suave ---
@@ -561,15 +745,17 @@ class RelaxHomeScreen extends StatefulWidget {
 }
 
 class _RelaxHomeScreenState extends State<RelaxHomeScreen>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   AudioPlayer get _audioPlayer => _audioHandler.player;
   VideoPlayerController? _videoController;
 
   late final AnimationController _sheetController;
+  late final AnimationController _vinylController;
   final TextEditingController _musicSearchCtrl = TextEditingController();
   final TextEditingController _videoSearchCtrl = TextEditingController();
   final TextEditingController _pinCtrl = TextEditingController();
   final TextEditingController _newPinCtrl = TextEditingController();
+  final ScrollController _lyricsScrollCtrl = ScrollController();
 
   List<MediaTrack> _allTracks = [];
   List<MediaTrack> _activeAudioQueue = [];
@@ -581,6 +767,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   bool _hasLogoAsset = false;
   Uri? _defaultLogoUri;
   String _cacheDir = '';
+  String _docsDir = '';
 
   int _activeTab = 0; // 0: Musica, 1: Videos, 2: Privado, 3: Ajustes
   String _musicFilter = 'Todas';
@@ -597,6 +784,36 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   double _volume = 0.85;
   double _speed = 1.0;
 
+  // Nuevas preferencias de personalizacion
+  bool _chameleonMode = true;
+  bool _vinylMode = false;
+  Color? _dynamicAccent;
+
+  // Ecualizador y refuerzo de bajos
+  bool _eqEnabled = false;
+  String _eqPreset = 'Plano';
+  double _loudnessBoost = 0.0; // 0.0 .. 0.50 (0 a +5 dB)
+  List<double> _eqSavedGains = [];
+
+  // Edicion personalizada de canciones y letras
+  Map<String, Map<String, String>> _trackOverrides = {};
+  Map<String, String> _customLyrics = {};
+  bool _showLyricsPanel = false;
+  List<LyricLine> _currentLyrics = [];
+  int _lastScrolledLyricIdx = -1;
+
+  // Video pantalla completa y gestos
+  bool _videoFullscreen = false;
+  bool _videoControlsVisible = true;
+  double _videoBrightness = 1.0; // 0.15 .. 1.0
+  String? _videoHudLabel;
+  IconData? _videoHudIcon;
+  Timer? _videoHudTimer;
+  Timer? _videoControlsTimer;
+  double _videoTapDownX = 0.0;
+  String _videoDragMode = '';
+
+  // Estado guardado general
   String _pin = '1234';
   Set<String> _favorites = {};
   Set<String> _privatePaths = {};
@@ -619,6 +836,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   Color get _subtext => widget.darkMode ? const Color(0xFF9E9EAA) : const Color(0xFF5D5D6B);
   Color get _border => widget.darkMode ? const Color(0xFF282836) : const Color(0xFFDCDCE6);
   Color get _accent => kAccentThemes[widget.accentName] ?? const Color(0xFF9B5DE5);
+  Color get _playerAccent => (_chameleonMode && _dynamicAccent != null) ? _dynamicAccent! : _accent;
 
   double get _bottomScrollClearance {
     final safeBottom = MediaQuery.of(context).padding.bottom;
@@ -633,14 +851,21 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       duration: const Duration(milliseconds: 300),
       reverseDuration: const Duration(milliseconds: 260),
     );
+    _vinylController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 14),
+    );
     _initEverything();
   }
 
   Future<void> _initEverything() async {
     final tmp = await getTemporaryDirectory();
+    final docs = await getApplicationDocumentsDirectory();
     _cacheDir = tmp.path;
+    _docsDir = docs.path;
     await _prepareLogoAsset();
     await _loadPrefs();
+    await _applySavedEqualizer();
     _bindAudioStreams();
     _startClockTimer();
     await _scanDeviceMedia(showToast: false);
@@ -668,6 +893,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final privList = prefs.getStringList('private_paths') ?? [];
     final plRaw = prefs.getString('playlists');
     final dailyRaw = prefs.getString('daily_seconds');
+    final overridesRaw = prefs.getString('track_overrides');
+    final lyricsRaw = prefs.getString('custom_lyrics');
+    final eqGainsRaw = prefs.getString('eq_gains');
 
     Map<String, List<String>> parsedPl = {};
     if (plRaw != null) {
@@ -689,15 +917,52 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       } catch (_) {}
     }
 
+    Map<String, Map<String, String>> parsedOverrides = {};
+    if (overridesRaw != null) {
+      try {
+        final decoded = jsonDecode(overridesRaw) as Map<String, dynamic>;
+        for (final entry in decoded.entries) {
+          final map = Map<String, dynamic>.from(entry.value as Map);
+          parsedOverrides[entry.key] = map.map((k, v) => MapEntry(k, v.toString()));
+        }
+      } catch (_) {}
+    }
+
+    Map<String, String> parsedLyrics = {};
+    if (lyricsRaw != null) {
+      try {
+        final decoded = jsonDecode(lyricsRaw) as Map<String, dynamic>;
+        for (final entry in decoded.entries) {
+          parsedLyrics[entry.key] = entry.value.toString();
+        }
+      } catch (_) {}
+    }
+
+    List<double> parsedEqGains = [];
+    if (eqGainsRaw != null) {
+      try {
+        final decoded = jsonDecode(eqGainsRaw) as List<dynamic>;
+        parsedEqGains = decoded.map((e) => (e as num).toDouble()).toList();
+      } catch (_) {}
+    }
+
     if (!mounted) return;
     setState(() {
       _pin = prefs.getString('pin') ?? '1234';
       _volume = prefs.getDouble('volume') ?? 0.85;
+      _chameleonMode = prefs.getBool('chameleon_mode') ?? true;
+      _vinylMode = prefs.getBool('vinyl_mode') ?? false;
+      _eqEnabled = prefs.getBool('eq_enabled') ?? false;
+      _eqPreset = prefs.getString('eq_preset') ?? 'Plano';
+      _loudnessBoost = prefs.getDouble('loudness_boost') ?? 0.0;
+      _eqSavedGains = parsedEqGains;
       _favorites = favList.toSet();
       _privatePaths = privList.toSet();
       _playlists = parsedPl;
       _totalPlays = prefs.getInt('total_plays') ?? 0;
       _dailySeconds = parsedDaily;
+      _trackOverrides = parsedOverrides;
+      _customLyrics = parsedLyrics;
     });
   }
 
@@ -707,11 +972,48 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     await prefs.setString('accent', widget.accentName);
     await prefs.setString('pin', _pin);
     await prefs.setDouble('volume', _volume);
+    await prefs.setBool('chameleon_mode', _chameleonMode);
+    await prefs.setBool('vinyl_mode', _vinylMode);
+    await prefs.setBool('eq_enabled', _eqEnabled);
+    await prefs.setString('eq_preset', _eqPreset);
+    await prefs.setDouble('loudness_boost', _loudnessBoost);
+    await prefs.setString('eq_gains', jsonEncode(_eqSavedGains));
     await prefs.setStringList('favorites', _favorites.toList());
     await prefs.setStringList('private_paths', _privatePaths.toList());
     await prefs.setString('playlists', jsonEncode(_playlists));
     await prefs.setInt('total_plays', _totalPlays);
     await prefs.setString('daily_seconds', jsonEncode(_dailySeconds));
+    await prefs.setString('track_overrides', jsonEncode(_trackOverrides));
+    await prefs.setString('custom_lyrics', jsonEncode(_customLyrics));
+  }
+
+  Future<void> _applySavedEqualizer() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _audioHandler.equalizer.setEnabled(_eqEnabled);
+      await _audioHandler.loudnessEnhancer.setEnabled(_eqEnabled && _loudnessBoost > 0.01);
+      await _audioHandler.loudnessEnhancer.setTargetGain(_loudnessBoost);
+      if (_eqSavedGains.isNotEmpty) {
+        final params = await _audioHandler.equalizer.parameters;
+        for (int i = 0; i < params.bands.length && i < _eqSavedGains.length; i++) {
+          final clamped = _eqSavedGains[i].clamp(params.minDecibels, params.maxDecibels);
+          await params.bands[i].setGain(clamped);
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _syncVinylAnimation() {
+    final shouldSpin = _vinylMode && _isPlaying && _currentTrack != null && !_currentTrack!.isVideo;
+    if (shouldSpin) {
+      if (!_vinylController.isAnimating) {
+        _vinylController.repeat();
+      }
+    } else {
+      if (_vinylController.isAnimating) {
+        _vinylController.stop();
+      }
+    }
   }
 
   void _bindAudioStreams() {
@@ -730,6 +1032,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       if (_currentTrack != null && !_currentTrack!.isVideo) {
         if (_isPlaying != st.playing) {
           setState(() => _isPlaying = st.playing);
+          _syncVinylAnimation();
         }
       }
     });
@@ -760,13 +1063,18 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   @override
   void dispose() {
+    _exitVideoFullscreen(restoreState: false);
     _clockTimer?.cancel();
+    _videoHudTimer?.cancel();
+    _videoControlsTimer?.cancel();
     _playerStateSub?.cancel();
     _audioHandler.onSkipNext = null;
     _audioHandler.onSkipPrevious = null;
     _audioHandler.onTrackCompleted = null;
     _videoController?.dispose();
     _sheetController.dispose();
+    _vinylController.dispose();
+    _lyricsScrollCtrl.dispose();
     _musicSearchCtrl.dispose();
     _videoSearchCtrl.dispose();
     _pinCtrl.dispose();
@@ -786,6 +1094,58 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       ),
     );
+  }
+
+  // --- Aplicar ediciones guardadas por el usuario ---
+
+  void _applyOverrideToTrack(MediaTrack t) {
+    final ov = _trackOverrides[t.path];
+    if (ov == null) return;
+    if ((ov['title'] ?? '').isNotEmpty) t.title = ov['title']!;
+    if ((ov['artist'] ?? '').isNotEmpty) t.artist = ov['artist']!;
+    final cp = ov['coverPath'] ?? '';
+    if (cp.isNotEmpty && File(cp).existsSync()) {
+      t.coverPath = cp;
+    }
+  }
+
+  Future<void> _refreshDynamicColorFor(MediaTrack track) async {
+    if (!_chameleonMode || track.isVideo) {
+      if (mounted && _dynamicAccent != null) {
+        setState(() => _dynamicAccent = null);
+      }
+      return;
+    }
+    final cp = track.coverPath;
+    if (cp == null || !File(cp).existsSync()) {
+      if (mounted && _dynamicAccent != null) {
+        setState(() => _dynamicAccent = null);
+      }
+      return;
+    }
+    final extracted = await CoverColorExtractor.extractDominant(cp);
+    if (mounted && _currentTrack?.path == track.path) {
+      setState(() => _dynamicAccent = extracted);
+    }
+  }
+
+  Future<void> _loadLyricsForTrack(MediaTrack track) async {
+    String raw = _customLyrics[track.path] ?? '';
+    if (raw.isEmpty) {
+      try {
+        final lrcFile = File('${pathWithoutExtension(track.path)}.lrc');
+        if (await lrcFile.exists()) {
+          raw = await lrcFile.readAsString();
+        }
+      } catch (_) {}
+    }
+    final parsed = raw.trim().isEmpty ? <LyricLine>[] : LyricsParser.parse(raw);
+    if (mounted && _currentTrack?.path == track.path) {
+      setState(() {
+        _currentLyrics = parsed;
+        _lastScrolledLyricIdx = -1;
+      });
+    }
   }
 
   // --- Permisos y escaneo automatico ---
@@ -813,6 +1173,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         await Permission.manageExternalStorage.request();
         found = await _walkMediaDirectories();
       }
+    }
+
+    for (final t in found) {
+      _applyOverrideToTrack(t);
     }
 
     if (!mounted) return;
@@ -970,7 +1334,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     return _sortList(base, sort);
   }
 
-  // --- Reproduccion de audio (con controles garantizados en notificacion) y video ---
+  // --- Reproduccion de audio y video ---
 
   Future<void> _playTrack(MediaTrack track, List<MediaTrack> queue, {bool openSheet = true}) async {
     _totalPlays++;
@@ -983,7 +1347,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       setState(() {
         _currentTrack = track;
         _isPlaying = true;
+        _dynamicAccent = null;
+        _showLyricsPanel = false;
+        _videoControlsVisible = true;
       });
+      _syncVinylAnimation();
       if (openSheet) _openPlayerSheet();
 
       final ctrl = VideoPlayerController.file(File(track.path));
@@ -999,7 +1367,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
               val.duration > Duration.zero &&
               val.position >= val.duration - const Duration(milliseconds: 250)) {
             _nextTrack();
-          } else {
+          } else if (_isPlaying != val.isPlaying) {
             setState(() => _isPlaying = val.isPlaying);
           }
         });
@@ -1010,8 +1378,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       return;
     }
 
+    await _exitVideoFullscreen();
     await _disposeVideo();
     await Id3Reader.loadTrackMetadata(track, _cacheDir);
+    _applyOverrideToTrack(track);
 
     final validQueue = queue.isEmpty ? [track] : List<MediaTrack>.from(queue);
     _activeAudioQueue = validQueue;
@@ -1022,8 +1392,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         _currentTrack = track;
         _isPlaying = true;
         _draggingSeekSec = null;
+        _lastScrolledLyricIdx = -1;
       });
     }
+    _syncVinylAnimation();
+    unawaited(_refreshDynamicColorFor(track));
+    unawaited(_loadLyricsForTrack(track));
     if (openSheet) _openPlayerSheet();
 
     try {
@@ -1056,9 +1430,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         speed: _speed,
         repeatOne: _repeat,
       );
+      await _applySavedEqualizer();
     } catch (_) {
       if (mounted) {
         setState(() => _isPlaying = false);
+        _syncVinylAnimation();
         _showSnack('No se pudo reproducir este archivo.');
       }
     }
@@ -1080,7 +1456,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     } else {
       await _audioHandler.pause();
     }
-    if (mounted) setState(() => _isPlaying = false);
+    if (mounted) {
+      setState(() => _isPlaying = false);
+      _syncVinylAnimation();
+    }
   }
 
   Future<void> _togglePlayPause() async {
@@ -1157,6 +1536,68 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     await _playTrack(_activeAudioQueue[prevIdx], _activeAudioQueue, openSheet: keepSheet);
   }
 
+  // --- Pantalla completa y gestos de video ---
+
+  Future<void> _enterVideoFullscreen() async {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    if (mounted) {
+      setState(() {
+        _videoFullscreen = true;
+        _videoControlsVisible = true;
+      });
+      _scheduleHideVideoControls();
+    }
+  }
+
+  Future<void> _exitVideoFullscreen({bool restoreState = true}) async {
+    if (!_videoFullscreen && restoreState) return;
+    _videoControlsTimer?.cancel();
+    await SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    if (restoreState && mounted) {
+      setState(() {
+        _videoFullscreen = false;
+        _videoControlsVisible = true;
+      });
+    }
+  }
+
+  void _scheduleHideVideoControls() {
+    _videoControlsTimer?.cancel();
+    if (!_videoFullscreen) return;
+    _videoControlsTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted && _videoFullscreen && _isPlaying) {
+        setState(() => _videoControlsVisible = false);
+      }
+    });
+  }
+
+  void _showVideoHud(IconData icon, String label) {
+    _videoHudTimer?.cancel();
+    setState(() {
+      _videoHudIcon = icon;
+      _videoHudLabel = label;
+    });
+    _videoHudTimer = Timer(const Duration(milliseconds: 950), () {
+      if (mounted) {
+        setState(() {
+          _videoHudIcon = null;
+          _videoHudLabel = null;
+        });
+      }
+    });
+  }
+
   // --- Animacion fluida 60 FPS al subir y bajar ---
 
   void _openPlayerSheet() {
@@ -1165,11 +1606,844 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   }
 
   void _closePlayerSheet() {
+    if (_videoFullscreen) {
+      _exitVideoFullscreen();
+    }
     if (_currentTrack != null && _currentTrack!.isVideo) {
       _videoController?.pause();
       setState(() => _isPlaying = false);
     }
     _sheetController.animateBack(0.0, curve: Curves.easeInOutCubic);
+  }
+
+  // --- Cola "A continuacion" ---
+
+  void _playNextInQueue(MediaTrack track) {
+    if (track.isVideo) {
+      _playTrack(track, _filteredList(true), openSheet: true);
+      return;
+    }
+    if (_currentTrack == null || _currentTrack!.isVideo || _activeAudioQueue.isEmpty) {
+      _playTrack(track, [track], openSheet: true);
+      return;
+    }
+    setState(() {
+      _activeAudioQueue.removeWhere((t) => t.path == track.path);
+      final curIdx = _activeAudioQueue.indexWhere((t) => t.path == _currentTrack!.path);
+      final insertAt = (curIdx >= 0 ? curIdx + 1 : 0).clamp(0, _activeAudioQueue.length);
+      _activeAudioQueue.insert(insertAt, track);
+    });
+    _showSnack('Sonará a continuación: ${track.title}');
+  }
+
+  void _appendToQueue(MediaTrack track) {
+    if (track.isVideo) return;
+    if (_currentTrack == null || _currentTrack!.isVideo || _activeAudioQueue.isEmpty) {
+      _playTrack(track, [track], openSheet: true);
+      return;
+    }
+    setState(() {
+      _activeAudioQueue.removeWhere((t) => t.path == track.path);
+      _activeAudioQueue.add(track);
+    });
+    _showSnack('Agregada al final de la cola.');
+  }
+
+  Future<void> _showQueueBottomSheet() async {
+    if (_activeAudioQueue.isEmpty) {
+      _showSnack('La cola está vacía.');
+      return;
+    }
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final dark = widget.darkMode;
+            final acc = _playerAccent;
+            return ClipRRect(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                child: Container(
+                  height: MediaQuery.of(ctx).size.height * 0.68,
+                  decoration: BoxDecoration(
+                    color: withA(_surface, dark ? 0.88 : 0.94),
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+                    border: Border(
+                      top: BorderSide(color: withA(Colors.white, dark ? 0.20 : 0.85), width: 1.2),
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 10),
+                      Container(
+                        width: 42,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: withA(_text, 0.25),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 14, 16, 10),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('A continuación', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: _text)),
+                                Text('${_activeAudioQueue.length} canciones en cola (arrastra para ordenar)', style: TextStyle(fontSize: 11, color: _subtext)),
+                              ],
+                            ),
+                            IconButton(
+                              icon: Icon(Icons.close_rounded, color: _subtext),
+                              onPressed: () => Navigator.pop(ctx),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Divider(height: 1, color: _border),
+                      Expanded(
+                        child: ReorderableListView.builder(
+                          buildDefaultDragHandles: false,
+                          padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+                          itemCount: _activeAudioQueue.length,
+                          onReorder: (oldIndex, newIndex) {
+                            setState(() {
+                              if (newIndex > oldIndex) newIndex -= 1;
+                              final item = _activeAudioQueue.removeAt(oldIndex);
+                              _activeAudioQueue.insert(newIndex, item);
+                            });
+                            setSheetState(() {});
+                          },
+                          itemBuilder: (_, i) {
+                            final t = _activeAudioQueue[i];
+                            final isCurrent = _currentTrack?.path == t.path;
+                            return Container(
+                              key: ValueKey('${t.path}_$i'),
+                              margin: const EdgeInsets.only(bottom: 6),
+                              decoration: BoxDecoration(
+                                color: isCurrent ? withA(acc, 0.18) : withA(_surfaceAlt, 0.72),
+                                borderRadius: BorderRadius.circular(14),
+                                border: isCurrent ? Border.all(color: withA(acc, 0.45)) : null,
+                              ),
+                              child: ListTile(
+                                dense: true,
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+                                leading: ReorderableDragStartListener(
+                                  index: i,
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(4),
+                                    child: Icon(
+                                      isCurrent ? Icons.graphic_eq_rounded : Icons.drag_handle_rounded,
+                                      color: isCurrent ? acc : _subtext,
+                                    ),
+                                  ),
+                                ),
+                                title: Text(
+                                  t.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: isCurrent ? acc : _text,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  t.artist,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 11, color: _subtext),
+                                ),
+                                trailing: isCurrent
+                                    ? null
+                                    : IconButton(
+                                        icon: Icon(Icons.close_rounded, size: 18, color: _subtext),
+                                        onPressed: () {
+                                          setState(() => _activeAudioQueue.removeAt(i));
+                                          setSheetState(() {});
+                                        },
+                                      ),
+                                onTap: () {
+                                  Navigator.pop(ctx);
+                                  _playTrack(t, _activeAudioQueue, openSheet: true);
+                                },
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // --- Ecualizador real + Refuerzo de bajos ---
+
+  Future<void> _showEqualizerSheet() async {
+    AndroidEqualizerParameters? params;
+    if (Platform.isAndroid) {
+      try {
+        params = await _audioHandler.equalizer.parameters;
+      } catch (_) {
+        params = null;
+      }
+    }
+
+    if (!mounted) return;
+    if (params == null) {
+      _showSnack('Reproduce una canción primero para activar el ecualizador.');
+      return;
+    }
+
+    final eqParams = params;
+    final bandValues = List<double>.generate(
+      eqParams.bands.length,
+      (i) => eqParams.bands[i].gain.clamp(eqParams.minDecibels, eqParams.maxDecibels),
+    );
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final dark = widget.darkMode;
+            final acc = _playerAccent;
+
+            Future<void> applyPreset(String presetName) async {
+              final weights = kEqPresets[presetName] ?? [0.0, 0.0, 0.0, 0.0, 0.0];
+              final span = min(eqParams.maxDecibels.abs(), eqParams.minDecibels.abs()) * 0.65;
+              setState(() {
+                _eqEnabled = true;
+                _eqPreset = presetName;
+              });
+              setSheetState(() {});
+              try {
+                await _audioHandler.equalizer.setEnabled(true);
+                for (int i = 0; i < eqParams.bands.length; i++) {
+                  final w = i < weights.length ? weights[i] : weights.last;
+                  final target = (w * span).clamp(eqParams.minDecibels, eqParams.maxDecibels);
+                  bandValues[i] = target;
+                  await eqParams.bands[i].setGain(target);
+                }
+                _eqSavedGains = List<double>.from(bandValues);
+                if (presetName == 'Bass Boost') {
+                  _loudnessBoost = 0.28;
+                } else if (presetName == 'Urbano') {
+                  _loudnessBoost = 0.20;
+                } else if (presetName == 'Plano') {
+                  _loudnessBoost = 0.0;
+                }
+                await _audioHandler.loudnessEnhancer.setEnabled(_loudnessBoost > 0.01);
+                await _audioHandler.loudnessEnhancer.setTargetGain(_loudnessBoost);
+                setSheetState(() {});
+                _savePrefs();
+              } catch (_) {}
+            }
+
+            return ClipRRect(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                child: Container(
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 26),
+                  decoration: BoxDecoration(
+                    color: withA(_surface, dark ? 0.90 : 0.95),
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+                    border: Border(
+                      top: BorderSide(color: withA(Colors.white, dark ? 0.20 : 0.85), width: 1.2),
+                    ),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 4,
+                        margin: const EdgeInsets.only(bottom: 14),
+                        decoration: BoxDecoration(
+                          color: withA(_text, 0.25),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.equalizer_rounded, color: acc, size: 24),
+                              const SizedBox(width: 8),
+                              Text('Ecualizador', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: _text)),
+                            ],
+                          ),
+                          Switch(
+                            value: _eqEnabled,
+                            onChanged: (v) async {
+                              setState(() => _eqEnabled = v);
+                              setSheetState(() {});
+                              try {
+                                await _audioHandler.equalizer.setEnabled(v);
+                                await _audioHandler.loudnessEnhancer.setEnabled(v && _loudnessBoost > 0.01);
+                              } catch (_) {}
+                              _savePrefs();
+                            },
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+
+                      // Presets rapidos
+                      SizedBox(
+                        height: 36,
+                        child: ListView(
+                          scrollDirection: Axis.horizontal,
+                          children: kEqPresets.keys.map((preset) {
+                            final selected = _eqEnabled && _eqPreset == preset;
+                            return Padding(
+                              padding: const EdgeInsets.only(right: 8),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(18),
+                                onTap: () => applyPreset(preset),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                                  decoration: BoxDecoration(
+                                    color: selected ? acc : _surfaceAlt,
+                                    borderRadius: BorderRadius.circular(18),
+                                  ),
+                                  alignment: Alignment.center,
+                                  child: Text(
+                                    preset,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: selected ? Colors.white : _text,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+
+                      // Sliders verticales por banda de frecuencia
+                      Opacity(
+                        opacity: _eqEnabled ? 1.0 : 0.45,
+                        child: SizedBox(
+                          height: 180,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            children: List.generate(eqParams.bands.length, (i) {
+                              final band = eqParams.bands[i];
+                              final val = bandValues[i];
+                              return Expanded(
+                                child: Column(
+                                  children: [
+                                    Text(
+                                      '${val >= 0 ? '+' : ''}${val.toStringAsFixed(0)}dB',
+                                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: acc),
+                                    ),
+                                    Expanded(
+                                      child: RotatedBox(
+                                        quarterTurns: 3,
+                                        child: SliderTheme(
+                                          data: SliderTheme.of(ctx).copyWith(
+                                            trackHeight: 4,
+                                            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                                            activeTrackColor: acc,
+                                            inactiveTrackColor: _border,
+                                            thumbColor: Colors.white,
+                                          ),
+                                          child: Slider(
+                                            min: eqParams.minDecibels,
+                                            max: eqParams.maxDecibels,
+                                            value: val,
+                                            onChanged: !_eqEnabled
+                                                ? null
+                                                : (v) async {
+                                                    setSheetState(() {
+                                                      bandValues[i] = v;
+                                                      _eqPreset = 'Personal';
+                                                    });
+                                                    try {
+                                                      await band.setGain(v);
+                                                    } catch (_) {}
+                                                  },
+                                            onChangeEnd: (_) {
+                                              _eqSavedGains = List<double>.from(bandValues);
+                                              _savePrefs();
+                                            },
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Text(
+                                      formatFrequency(band.centerFrequency),
+                                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: _subtext),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+
+                      // Barra de refuerzo de potencia / bajos (LoudnessEnhancer)
+                      Opacity(
+                        opacity: _eqEnabled ? 1.0 : 0.45,
+                        child: Container(
+                          padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
+                          decoration: BoxDecoration(
+                            color: _surfaceAlt,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Column(
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Icon(Icons.speaker_rounded, size: 16, color: acc),
+                                      const SizedBox(width: 6),
+                                      Text('Refuerzo de potencia', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _text)),
+                                    ],
+                                  ),
+                                  Text(
+                                    '${(_loudnessBoost / 0.50 * 100).round()}%',
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: acc),
+                                  ),
+                                ],
+                              ),
+                              Slider(
+                                min: 0.0,
+                                max: 0.50,
+                                value: _loudnessBoost.clamp(0.0, 0.50),
+                                activeColor: acc,
+                                inactiveColor: _border,
+                                onChanged: !_eqEnabled
+                                    ? null
+                                    : (v) async {
+                                        setState(() => _loudnessBoost = v);
+                                        setSheetState(() {});
+                                        try {
+                                          await _audioHandler.loudnessEnhancer.setEnabled(v > 0.01);
+                                          await _audioHandler.loudnessEnhancer.setTargetGain(v);
+                                        } catch (_) {}
+                                      },
+                                onChangeEnd: (_) => _savePrefs(),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // --- Editor rapido de titulo, artista y portada (con galeria) ---
+
+  Future<void> _showEditTrackSheet(MediaTrack track) async {
+    final titleCtrl = TextEditingController(text: track.title);
+    final artistCtrl = TextEditingController(text: track.artist);
+    String? tempCover = track.coverPath;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
+            final acc = _playerAccent;
+            final hasCustomCover = tempCover != null && File(tempCover!).existsSync();
+
+            return Padding(
+              padding: EdgeInsets.only(bottom: bottomInset),
+              child: ClipRRect(
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+                child: BackdropFilter(
+                  filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
+                    decoration: BoxDecoration(
+                      color: withA(_surface, widget.darkMode ? 0.92 : 0.96),
+                      borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+                      border: Border(
+                        top: BorderSide(color: withA(Colors.white, widget.darkMode ? 0.20 : 0.85), width: 1.2),
+                      ),
+                    ),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 42,
+                            height: 4,
+                            margin: const EdgeInsets.only(bottom: 14),
+                            decoration: BoxDecoration(
+                              color: withA(_text, 0.25),
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                          Text('Editar canción', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: _text)),
+                          const SizedBox(height: 14),
+
+                          // Vista previa de portada + boton cambiar foto
+                          Row(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(16),
+                                child: hasCustomCover
+                                    ? Image.file(File(tempCover!), width: 76, height: 76, fit: BoxFit.cover)
+                                    : Container(
+                                        width: 76,
+                                        height: 76,
+                                        color: _surfaceAlt,
+                                        child: Icon(Icons.music_note_rounded, color: acc, size: 32),
+                                      ),
+                              ),
+                              const SizedBox(width: 14),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    FilledButton.icon(
+                                      style: FilledButton.styleFrom(backgroundColor: acc),
+                                      onPressed: () async {
+                                        try {
+                                          final picked = await ImagePicker().pickImage(
+                                            source: ImageSource.gallery,
+                                            maxWidth: 900,
+                                            maxHeight: 900,
+                                            imageQuality: 88,
+                                          );
+                                          if (picked != null) {
+                                            final coversDir = Directory('$_docsDir/custom_covers');
+                                            if (!await coversDir.exists()) {
+                                              await coversDir.create(recursive: true);
+                                            }
+                                            final hash = track.path.hashCode.abs();
+                                            final ts = DateTime.now().millisecondsSinceEpoch;
+                                            final dest = File('${coversDir.path}/cov_${hash}_$ts.jpg');
+                                            await File(picked.path).copy(dest.path);
+                                            setSheetState(() => tempCover = dest.path);
+                                          }
+                                        } catch (_) {
+                                          _showSnack('No se pudo abrir la galería.');
+                                        }
+                                      },
+                                      icon: const Icon(Icons.photo_library_rounded, size: 17, color: Colors.white),
+                                      label: const Text('Elegir portada', style: TextStyle(color: Colors.white, fontSize: 12)),
+                                    ),
+                                    if (hasCustomCover)
+                                      TextButton(
+                                        onPressed: () => setSheetState(() => tempCover = ''),
+                                        child: Text('Quitar portada', style: TextStyle(color: _subtext, fontSize: 11)),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+
+                          TextField(
+                            controller: titleCtrl,
+                            style: TextStyle(color: _text, fontSize: 14),
+                            decoration: InputDecoration(
+                              labelText: 'Título',
+                              labelStyle: TextStyle(color: _subtext),
+                              filled: true,
+                              fillColor: _surfaceAlt,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: BorderSide.none,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: artistCtrl,
+                            style: TextStyle(color: _text, fontSize: 14),
+                            decoration: InputDecoration(
+                              labelText: 'Artista',
+                              labelStyle: TextStyle(color: _subtext),
+                              filled: true,
+                              fillColor: _surfaceAlt,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: BorderSide.none,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(ctx),
+                                child: Text('Cancelar', style: TextStyle(color: _subtext)),
+                              ),
+                              const SizedBox(width: 8),
+                              FilledButton(
+                                style: FilledButton.styleFrom(backgroundColor: acc),
+                                onPressed: () async {
+                                  final newTitle = titleCtrl.text.trim();
+                                  final newArtist = artistCtrl.text.trim();
+                                  setState(() {
+                                    if (newTitle.isNotEmpty) track.title = newTitle;
+                                    if (newArtist.isNotEmpty) track.artist = newArtist;
+                                    if (tempCover == '') {
+                                      track.coverPath = null;
+                                    } else if (tempCover != null) {
+                                      CoverColorExtractor.invalidate(tempCover!);
+                                      track.coverPath = tempCover;
+                                    }
+                                    _trackOverrides[track.path] = {
+                                      'title': track.title,
+                                      'artist': track.artist,
+                                      'coverPath': track.coverPath ?? '',
+                                    };
+                                  });
+                                  await _savePrefs();
+                                  if (_currentTrack?.path == track.path) {
+                                    final Uri? art = (track.coverPath != null && File(track.coverPath!).existsSync())
+                                        ? Uri.file(track.coverPath!)
+                                        : _defaultLogoUri;
+                                    _audioHandler.updateCurrentMetadata(
+                                      track.path,
+                                      title: track.title,
+                                      artist: track.artist,
+                                      artUri: art,
+                                    );
+                                    await _refreshDynamicColorFor(track);
+                                  }
+                                  if (ctx.mounted) Navigator.pop(ctx);
+                                  _showSnack('Cambios guardados.');
+                                },
+                                child: const Text('Guardar', style: TextStyle(color: Colors.white)),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // --- Editor de letra de la cancion (soporta texto plano o formato .lrc sincronizado) ---
+
+  Future<void> _showEditLyricsDialog(MediaTrack track) async {
+    String initialText = _customLyrics[track.path] ?? '';
+    if (initialText.isEmpty) {
+      try {
+        final lrc = File('${pathWithoutExtension(track.path)}.lrc');
+        if (await lrc.exists()) initialText = await lrc.readAsString();
+      } catch (_) {}
+    }
+
+    final ctrl = TextEditingController(text: initialText);
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _surface,
+        title: Text('Letra de la canción', style: TextStyle(color: _text, fontWeight: FontWeight.w600, fontSize: 17)),
+        content: SizedBox(
+          width: 320,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Pega la letra normal o en formato sincronizado [00:15.00] Línea...',
+                style: TextStyle(color: _subtext, fontSize: 11),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: ctrl,
+                maxLines: 9,
+                style: TextStyle(color: _text, fontSize: 13),
+                decoration: InputDecoration(
+                  hintText: 'Pega aquí la letra...',
+                  hintStyle: TextStyle(color: _subtext),
+                  filled: true,
+                  fillColor: _surfaceAlt,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          if (initialText.isNotEmpty)
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _customLyrics.remove(track.path);
+                  _currentLyrics = [];
+                });
+                _savePrefs();
+                Navigator.pop(ctx);
+                _showSnack('Letra eliminada.');
+              },
+              child: Text('Borrar', style: TextStyle(color: _subtext)),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancelar', style: TextStyle(color: _subtext)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: _playerAccent),
+            onPressed: () {
+              final raw = ctrl.text.trim();
+              setState(() {
+                if (raw.isEmpty) {
+                  _customLyrics.remove(track.path);
+                  _currentLyrics = [];
+                } else {
+                  _customLyrics[track.path] = raw;
+                  _currentLyrics = LyricsParser.parse(raw);
+                }
+                _lastScrolledLyricIdx = -1;
+              });
+              _savePrefs();
+              Navigator.pop(ctx);
+              _showSnack('Letra guardada.');
+            },
+            child: const Text('Guardar', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // --- Menu de opciones por cancion ---
+
+  Future<void> _showTrackOptionsSheet(MediaTrack track) async {
+    final isFav = _favorites.contains(track.path);
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => ClipRRect(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(26)),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 20),
+            decoration: BoxDecoration(
+              color: withA(_surface, widget.darkMode ? 0.92 : 0.96),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(26)),
+              border: Border(
+                top: BorderSide(color: withA(Colors.white, widget.darkMode ? 0.18 : 0.85)),
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  decoration: BoxDecoration(color: withA(_text, 0.25), borderRadius: BorderRadius.circular(2)),
+                ),
+                ListTile(
+                  title: Text(track.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: _text, fontWeight: FontWeight.w700, fontSize: 15)),
+                  subtitle: Text(track.artist, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: _subtext, fontSize: 12)),
+                ),
+                Divider(height: 1, color: _border),
+                if (!track.isVideo) ...[
+                  ListTile(
+                    leading: Icon(Icons.playlist_play_rounded, color: _accent),
+                    title: Text('Reproducir siguiente', style: TextStyle(color: _text, fontSize: 14)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _playNextInQueue(track);
+                    },
+                  ),
+                  ListTile(
+                    leading: Icon(Icons.queue_music_rounded, color: _subtext),
+                    title: Text('Agregar al final de la cola', style: TextStyle(color: _text, fontSize: 14)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _appendToQueue(track);
+                    },
+                  ),
+                  ListTile(
+                    leading: Icon(Icons.playlist_add_rounded, color: _subtext),
+                    title: Text('Agregar a una lista', style: TextStyle(color: _text, fontSize: 14)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _showAddToPlaylistDialog(track.path);
+                    },
+                  ),
+                  ListTile(
+                    leading: Icon(Icons.edit_rounded, color: _subtext),
+                    title: Text('Editar nombre, artista y portada', style: TextStyle(color: _text, fontSize: 14)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _showEditTrackSheet(track);
+                    },
+                  ),
+                ],
+                ListTile(
+                  leading: Icon(isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded, color: isFav ? _accent : _subtext),
+                  title: Text(isFav ? 'Quitar de Favoritos' : 'Guardar en Favoritos', style: TextStyle(color: _text, fontSize: 14)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _toggleFavorite(track.path);
+                  },
+                ),
+                ListTile(
+                  leading: Icon(Icons.lock_outline_rounded, color: _subtext),
+                  title: Text('Mover a Zona Privada', style: TextStyle(color: _text, fontSize: 14)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _moveToPrivate(track.path);
+                  },
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   // --- Favoritos, playlists, velocidad, temporizador ---
@@ -1319,11 +2593,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
               title: Text(
                 '${s == s.roundToDouble() ? s.toInt() : s}x${s == 1.0 ? ' (Normal)' : ''}',
                 style: TextStyle(
-                  color: active ? _accent : _text,
+                  color: active ? _playerAccent : _text,
                   fontWeight: active ? FontWeight.w600 : FontWeight.w400,
                 ),
               ),
-              trailing: active ? Icon(Icons.check_rounded, color: _accent) : null,
+              trailing: active ? Icon(Icons.check_rounded, color: _playerAccent) : null,
               onTap: () {
                 setState(() => _speed = s);
                 _audioPlayer.setSpeed(s);
@@ -1362,7 +2636,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Logo y Portada con aura viva ---
+  // --- Logo, Portada clasica, Disco de Vinilo girando y Panel de Letras ---
 
   Widget _buildLogoAvatar(double size) {
     if (_hasLogoAsset) {
@@ -1394,7 +2668,146 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
+  Widget _buildVinylDisc(MediaTrack? track, double size) {
+    final acc = _playerAccent;
+    final coverFile = (track?.coverPath != null) ? File(track!.coverPath!) : null;
+    final labelSize = size * 0.44;
+
+    Widget labelContent;
+    if (coverFile != null && coverFile.existsSync()) {
+      labelContent = ClipOval(
+        child: Image.file(coverFile, width: labelSize, height: labelSize, fit: BoxFit.cover),
+      );
+    } else if (_hasLogoAsset) {
+      labelContent = Container(
+        width: labelSize,
+        height: labelSize,
+        padding: const EdgeInsets.all(6),
+        decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+        child: ClipOval(child: Image.asset('assets/logo.png', fit: BoxFit.contain)),
+      );
+    } else {
+      labelContent = Container(
+        width: labelSize,
+        height: labelSize,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [acc, Color.lerp(acc, Colors.black, 0.35) ?? acc],
+          ),
+        ),
+        child: Icon(Icons.headphones_rounded, color: Colors.white, size: labelSize * 0.45),
+      );
+    }
+
+    return AnimatedScale(
+      scale: _isPlaying ? 1.0 : 0.94,
+      duration: const Duration(milliseconds: 340),
+      curve: Curves.easeOutCubic,
+      child: Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          boxShadow: [
+            BoxShadow(
+              color: withA(acc, _isPlaying ? 0.36 : 0.12),
+              blurRadius: _isPlaying ? 34 : 18,
+              offset: const Offset(0, 12),
+            ),
+            BoxShadow(
+              color: withA(Colors.black, 0.55),
+              blurRadius: 24,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            RotationTransition(
+              turns: _vinylController,
+              child: Container(
+                width: size,
+                height: size,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const RadialGradient(
+                    colors: [
+                      Color(0xFF22222A),
+                      Color(0xFF101016),
+                      Color(0xFF1A1A22),
+                      Color(0xFF0A0A0E),
+                    ],
+                    stops: [0.22, 0.48, 0.72, 1.0],
+                  ),
+                  border: Border.all(color: withA(Colors.white, 0.14), width: 1.5),
+                ),
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    // Surcos finos del vinilo
+                    for (final factor in [0.88, 0.76, 0.64, 0.54])
+                      Container(
+                        width: size * factor,
+                        height: size * factor,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: withA(Colors.white, 0.06), width: 1),
+                        ),
+                      ),
+                    // Etiqueta central con portada o logo
+                    Container(
+                      padding: const EdgeInsets.all(3),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(color: withA(acc, 0.65), width: 2),
+                      ),
+                      child: labelContent,
+                    ),
+                    // Orificio central del vinilo
+                    Container(
+                      width: 14,
+                      height: 14,
+                      decoration: BoxDecoration(
+                        color: _bg,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: withA(Colors.white, 0.35), width: 1.5),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // Brillo diagonal fijo sobre el disco mientras gira
+            IgnorePointer(
+              child: Container(
+                width: size,
+                height: size,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: SweepGradient(
+                    colors: [
+                      Colors.transparent,
+                      withA(Colors.white, 0.10),
+                      Colors.transparent,
+                      withA(Colors.white, 0.08),
+                      Colors.transparent,
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildBigCover(MediaTrack? track, double size) {
+    final acc = _playerAccent;
     final coverFile = (track?.coverPath != null) ? File(track!.coverPath!) : null;
     Widget inner;
 
@@ -1432,13 +2845,13 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: [
-              blendSolid(_accent, _surfaceAlt, 0.16),
+              blendSolid(acc, _surfaceAlt, 0.16),
               _surfaceAlt,
             ],
           ),
           border: Border.all(color: withA(Colors.white, widget.darkMode ? 0.12 : 0.6)),
         ),
-        child: Icon(Icons.headphones_rounded, size: size * 0.36, color: _accent),
+        child: Icon(Icons.headphones_rounded, size: size * 0.36, color: acc),
       );
     }
 
@@ -1453,7 +2866,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           borderRadius: BorderRadius.circular(26),
           boxShadow: [
             BoxShadow(
-              color: withA(_accent, _isPlaying ? 0.34 : 0.10),
+              color: withA(acc, _isPlaying ? 0.36 : 0.10),
               blurRadius: _isPlaying ? 34 : 16,
               spreadRadius: _isPlaying ? -2 : -6,
               offset: const Offset(0, 14),
@@ -1470,6 +2883,133 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
+  Widget _buildLyricsStage(MediaTrack track, double size) {
+    final acc = _playerAccent;
+    final dark = widget.darkMode;
+
+    return Container(
+      width: double.infinity,
+      height: size,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: dark
+              ? [withA(Colors.white, 0.10), withA(const Color(0xFF14141E), 0.72)]
+              : [withA(Colors.white, 0.85), withA(Colors.white, 0.60)],
+        ),
+        border: Border.all(color: dark ? withA(Colors.white, 0.16) : withA(Colors.black, 0.08)),
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.lyrics_rounded, size: 16, color: acc),
+                  const SizedBox(width: 6),
+                  Text('Letra', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _text)),
+                ],
+              ),
+              TextButton.icon(
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: () => _showEditLyricsDialog(track),
+                icon: Icon(Icons.edit_rounded, size: 14, color: acc),
+                label: Text(
+                  _currentLyrics.isEmpty ? 'Pegar letra' : 'Editar',
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: acc),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Expanded(
+            child: _currentLyrics.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.lyrics_outlined, size: 36, color: withA(_subtext, 0.6)),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Sin letra guardada todavía',
+                          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Toca "Pegar letra" o coloca un archivo .lrc junto a tu canción.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11, color: _subtext),
+                        ),
+                      ],
+                    ),
+                  )
+                : StreamBuilder<Duration>(
+                    stream: _audioPlayer.positionStream,
+                    builder: (context, snap) {
+                      final pos = snap.data ?? Duration.zero;
+                      final activeIdx = LyricsParser.activeIndex(_currentLyrics, pos);
+
+                      if (activeIdx >= 0 && activeIdx != _lastScrolledLyricIdx && _lyricsScrollCtrl.hasClients) {
+                        _lastScrolledLyricIdx = activeIdx;
+                        final targetOffset = max(0.0, (activeIdx * 42.0) - (size * 0.30));
+                        final maxScroll = _lyricsScrollCtrl.position.maxScrollExtent;
+                        _lyricsScrollCtrl.animateTo(
+                          targetOffset.clamp(0.0, maxScroll),
+                          duration: const Duration(milliseconds: 350),
+                          curve: Curves.easeOutCubic,
+                        );
+                      }
+
+                      return ListView.builder(
+                        controller: _lyricsScrollCtrl,
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        itemCount: _currentLyrics.length,
+                        itemBuilder: (_, i) {
+                          final line = _currentLyrics[i];
+                          final isSynced = line.time != null;
+                          final isActive = isSynced && i == activeIdx;
+
+                          return GestureDetector(
+                            onTap: isSynced
+                                ? () => _audioHandler.seek(line.time!)
+                                : null,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 7),
+                              child: AnimatedDefaultTextStyle(
+                                duration: const Duration(milliseconds: 220),
+                                style: TextStyle(
+                                  fontFamily: 'Poppins',
+                                  fontSize: isActive ? 17 : 14,
+                                  fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+                                  color: isActive
+                                      ? acc
+                                      : (isSynced ? withA(_text, 0.56) : _text),
+                                ),
+                                child: Text(
+                                  line.text,
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // --- Controles de reproduccion con vida y acabado Liquid Glass ---
 
   Widget _buildGlassCircleButton({
@@ -1479,10 +3019,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     double iconSize = 26,
     bool active = false,
     bool showActiveDot = false,
+    Color? accentOverride,
   }) {
     final dark = widget.darkMode;
+    final acc = accentOverride ?? _playerAccent;
     final fg = active
-        ? (dark ? Colors.white : _accent)
+        ? (dark ? Colors.white : acc)
         : (dark ? withA(Colors.white, 0.90) : _text);
 
     return _SpringPressButton(
@@ -1502,8 +3044,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                 end: Alignment.bottomRight,
                 colors: active
                     ? [
-                        withA(_accent, dark ? 0.42 : 0.28),
-                        withA(_accent, dark ? 0.18 : 0.12),
+                        withA(acc, dark ? 0.42 : 0.28),
+                        withA(acc, dark ? 0.18 : 0.12),
                       ]
                     : (dark
                         ? [
@@ -1517,14 +3059,14 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
               ),
               border: Border.all(
                 color: active
-                    ? withA(_accent, 0.65)
+                    ? withA(acc, 0.65)
                     : (dark ? withA(Colors.white, 0.18) : withA(Colors.black, 0.08)),
                 width: 1.15,
               ),
               boxShadow: [
                 if (active)
                   BoxShadow(
-                    color: withA(_accent, 0.34),
+                    color: withA(acc, 0.34),
                     blurRadius: 16,
                     spreadRadius: -2,
                   ),
@@ -1544,10 +3086,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
               width: active ? 5 : 0,
               height: active ? 5 : 0,
               decoration: BoxDecoration(
-                color: _accent,
+                color: acc,
                 shape: BoxShape.circle,
                 boxShadow: [
-                  BoxShadow(color: withA(_accent, 0.7), blurRadius: 6),
+                  BoxShadow(color: withA(acc, 0.7), blurRadius: 6),
                 ],
               ),
             ),
@@ -1557,9 +3099,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  Widget _buildHeroPlayPauseOrb({double size = 74, double iconSize = 38}) {
-    final lightTint = Color.lerp(_accent, Colors.white, 0.34) ?? _accent;
-    final deepTint = Color.lerp(_accent, Colors.black, 0.24) ?? _accent;
+  Widget _buildHeroPlayPauseOrb({double size = 74, double iconSize = 38, Color? accentOverride}) {
+    final acc = accentOverride ?? _playerAccent;
+    final lightTint = Color.lerp(acc, Colors.white, 0.34) ?? acc;
+    final deepTint = Color.lerp(acc, Colors.black, 0.24) ?? acc;
 
     return _SpringPressButton(
       onTap: _togglePlayPause,
@@ -1575,7 +3118,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             stops: const [0.0, 0.42, 1.0],
-            colors: [lightTint, _accent, deepTint],
+            colors: [lightTint, acc, deepTint],
           ),
           border: Border.all(
             color: withA(Colors.white, 0.45),
@@ -1583,7 +3126,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           ),
           boxShadow: [
             BoxShadow(
-              color: withA(_accent, _isPlaying ? 0.62 : 0.34),
+              color: withA(acc, _isPlaying ? 0.62 : 0.34),
               blurRadius: _isPlaying ? 28 : 16,
               spreadRadius: _isPlaying ? 1 : -2,
               offset: const Offset(0, 8),
@@ -1598,7 +3141,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         child: Stack(
           alignment: Alignment.center,
           children: [
-            // Reflejo cristalino superior tipo Liquid Glass
             Positioned(
               top: 4,
               left: size * 0.20,
@@ -1618,7 +3160,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                 ),
               ),
             ),
-            // Icono Play / Pausa con transicion elastica
             AnimatedSwitcher(
               duration: const Duration(milliseconds: 220),
               switchInCurve: Curves.easeOutBack,
@@ -1640,7 +3181,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Construccion Principal con Dock Liquid Glass flotante ---
+  // --- Construccion Principal ---
 
   @override
   Widget build(BuildContext context) {
@@ -1651,10 +3192,14 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       builder: (context, _) {
         final sheetOpen = _sheetController.value > 0.01;
         return PopScope(
-          canPop: !sheetOpen,
+          canPop: !sheetOpen && !_videoFullscreen,
           onPopInvokedWithResult: (didPop, _) {
-            if (!didPop && sheetOpen) {
-              _closePlayerSheet();
+            if (!didPop) {
+              if (_videoFullscreen) {
+                _exitVideoFullscreen();
+              } else if (sheetOpen) {
+                _closePlayerSheet();
+              }
             }
           },
           child: Scaffold(
@@ -1757,16 +3302,26 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ),
                 ],
               ),
-              IconButton(
-                icon: _scanning
-                    ? SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: _accent),
-                      )
-                    : Icon(Icons.refresh_rounded, color: _accent, size: 24),
-                tooltip: 'Actualizar biblioteca',
-                onPressed: () => _scanDeviceMedia(showToast: true),
+              Row(
+                children: [
+                  if (!isVideo)
+                    IconButton(
+                      icon: Icon(Icons.equalizer_rounded, color: _eqEnabled ? _accent : _subtext, size: 23),
+                      tooltip: 'Ecualizador',
+                      onPressed: _showEqualizerSheet,
+                    ),
+                  IconButton(
+                    icon: _scanning
+                        ? SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: _accent),
+                          )
+                        : Icon(Icons.refresh_rounded, color: _accent, size: 24),
+                    tooltip: 'Actualizar biblioteca',
+                    onPressed: () => _scanDeviceMedia(showToast: true),
+                  ),
+                ],
               ),
             ],
           ),
@@ -1979,6 +3534,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       final t = tracks[i];
                       final isCurrent = _currentTrack?.path == t.path;
                       final isFav = _favorites.contains(t.path);
+                      final hasThumb = !isVideo && t.coverPath != null && File(t.coverPath!).existsSync();
+
                       return Padding(
                         padding: const EdgeInsets.only(bottom: 6),
                         child: Material(
@@ -1987,25 +3544,36 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                           child: InkWell(
                             borderRadius: BorderRadius.circular(12),
                             onTap: () => _playTrack(t, tracks, openSheet: true),
+                            onLongPress: () => _showTrackOptionsSheet(t),
                             child: Padding(
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                               child: Row(
                                 children: [
-                                  Container(
-                                    width: 42,
-                                    height: 42,
-                                    decoration: BoxDecoration(
-                                      color: isCurrent ? withA(_accent, 0.25) : _surfaceAlt,
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                    child: Icon(
-                                      isCurrent
-                                          ? Icons.graphic_eq_rounded
-                                          : (isVideo ? Icons.play_circle_fill_rounded : Icons.music_note_rounded),
-                                      size: 21,
-                                      color: isCurrent ? _accent : _subtext,
-                                    ),
-                                  ),
+                                  hasThumb
+                                      ? ClipRRect(
+                                          borderRadius: BorderRadius.circular(10),
+                                          child: Image.file(
+                                            File(t.coverPath!),
+                                            width: 42,
+                                            height: 42,
+                                            fit: BoxFit.cover,
+                                          ),
+                                        )
+                                      : Container(
+                                          width: 42,
+                                          height: 42,
+                                          decoration: BoxDecoration(
+                                            color: isCurrent ? withA(_accent, 0.25) : _surfaceAlt,
+                                            borderRadius: BorderRadius.circular(10),
+                                          ),
+                                          child: Icon(
+                                            isCurrent
+                                                ? Icons.graphic_eq_rounded
+                                                : (isVideo ? Icons.play_circle_fill_rounded : Icons.music_note_rounded),
+                                            size: 21,
+                                            color: isCurrent ? _accent : _subtext,
+                                          ),
+                                        ),
                                   const SizedBox(width: 10),
                                   Expanded(
                                     child: Column(
@@ -2023,7 +3591,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                           ),
                                         ),
                                         Text(
-                                          '${t.folder} / ${t.ext}',
+                                          isVideo ? '${t.folder} / ${t.ext}' : '${t.artist} / ${t.ext}',
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                           style: TextStyle(fontSize: 11, color: _subtext),
@@ -2040,8 +3608,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                     onPressed: () => _toggleFavorite(t.path),
                                   ),
                                   IconButton(
-                                    icon: Icon(Icons.lock_outline_rounded, size: 19, color: _subtext),
-                                    onPressed: () => _moveToPrivate(t.path),
+                                    icon: Icon(Icons.more_vert_rounded, size: 20, color: _subtext),
+                                    onPressed: () => _showTrackOptionsSheet(t),
                                   ),
                                 ],
                               ),
@@ -2262,6 +3830,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 12),
 
+        // Apariencia + Colores Camaleon + Modo Vinilo
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -2281,7 +3850,57 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Colores camaleón', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _text)),
+                        Text('Adapta el reproductor al color de cada portada', style: TextStyle(fontSize: 11, color: _subtext)),
+                      ],
+                    ),
+                  ),
+                  Switch(
+                    value: _chameleonMode,
+                    onChanged: (v) {
+                      setState(() {
+                        _chameleonMode = v;
+                        if (!v) _dynamicAccent = null;
+                      });
+                      _savePrefs();
+                      if (v && _currentTrack != null) {
+                        _refreshDynamicColorFor(_currentTrack!);
+                      }
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Modo disco de vinilo', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _text)),
+                        Text('Muestra un vinilo girando al reproducir', style: TextStyle(fontSize: 11, color: _subtext)),
+                      ],
+                    ),
+                  ),
+                  Switch(
+                    value: _vinylMode,
+                    onChanged: (v) {
+                      setState(() => _vinylMode = v);
+                      _syncVinylAnimation();
+                      _savePrefs();
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
               Text('Color principal', style: TextStyle(fontSize: 12, color: _subtext)),
               const SizedBox(height: 10),
               Row(
@@ -2313,6 +3932,35 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 12),
 
+        // Acceso rapido al Ecualizador
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Ecualizador y bajos', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _text)),
+                  Text(
+                    _eqEnabled ? 'Activo ($_eqPreset)' : 'Desactivado',
+                    style: TextStyle(fontSize: 11, color: _eqEnabled ? _accent : _subtext),
+                  ),
+                ],
+              ),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(backgroundColor: _accent),
+                onPressed: _showEqualizerSheet,
+                icon: const Icon(Icons.equalizer_rounded, size: 16, color: Colors.white),
+                label: const Text('Abrir', style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+
+        // PIN
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -2358,6 +4006,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 12),
 
+        // Biblioteca
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -2384,12 +4033,13 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Mini Reproductor con efecto cristal a juego ---
+  // --- Mini Reproductor con efecto cristal ---
 
   Widget _buildMiniPlayerGlass() {
     final track = _currentTrack!;
     final coverFile = (track.coverPath != null) ? File(track.coverPath!) : null;
     final dark = widget.darkMode;
+    final acc = _playerAccent;
 
     Widget thumb;
     if (coverFile != null && coverFile.existsSync()) {
@@ -2409,8 +4059,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       thumb = Container(
         width: 42,
         height: 42,
-        decoration: BoxDecoration(color: withA(_accent, 0.25), borderRadius: BorderRadius.circular(12)),
-        child: Icon(track.isVideo ? Icons.movie_rounded : Icons.music_note_rounded, color: _accent, size: 22),
+        decoration: BoxDecoration(color: withA(acc, 0.25), borderRadius: BorderRadius.circular(12)),
+        child: Icon(track.isVideo ? Icons.movie_rounded : Icons.music_note_rounded, color: acc, size: 22),
       );
     }
 
@@ -2428,7 +4078,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(22),
         child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
           child: Material(
             color: Colors.transparent,
             child: InkWell(
@@ -2444,12 +4094,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         ? [
                             withA(Colors.white, 0.15),
                             withA(const Color(0xFF1A1A26), 0.72),
-                            withA(_accent, 0.16),
+                            withA(acc, 0.18),
                           ]
                         : [
                             withA(Colors.white, 0.84),
                             withA(Colors.white, 0.62),
-                            withA(_accent, 0.12),
+                            withA(acc, 0.12),
                           ],
                   ),
                   border: Border.all(
@@ -2491,12 +4141,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             begin: Alignment.topLeft,
                             end: Alignment.bottomRight,
                             colors: [
-                              Color.lerp(_accent, Colors.white, 0.22) ?? _accent,
-                              _accent,
+                              Color.lerp(acc, Colors.white, 0.22) ?? acc,
+                              acc,
                             ],
                           ),
                           boxShadow: [
-                            BoxShadow(color: withA(_accent, 0.40), blurRadius: 10),
+                            BoxShadow(color: withA(acc, 0.40), blurRadius: 10),
                           ],
                         ),
                         child: Icon(
@@ -2560,7 +4210,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(34),
         child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 26, sigmaY: 26),
+          filter: ui.ImageFilter.blur(sigmaX: 26, sigmaY: 26),
           child: Container(
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(34),
@@ -2610,7 +4260,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         ),
                       ),
                     ),
-
                     AnimatedPositioned(
                       duration: const Duration(milliseconds: 300),
                       curve: Curves.easeOutCubic,
@@ -2625,14 +4274,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             begin: Alignment.topCenter,
                             end: Alignment.bottomCenter,
                             colors: dark
-                                ? [
-                                    withA(_accent, 0.40),
-                                    withA(_accent, 0.18),
-                                  ]
-                                : [
-                                    withA(Colors.white, 0.90),
-                                    withA(_accent, 0.20),
-                                  ],
+                                ? [withA(_accent, 0.40), withA(_accent, 0.18)]
+                                : [withA(Colors.white, 0.90), withA(_accent, 0.20)],
                           ),
                           border: Border.all(
                             color: dark ? withA(Colors.white, 0.30) : withA(Colors.white, 0.95),
@@ -2648,7 +4291,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         ),
                       ),
                     ),
-
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: padH),
                       child: Row(
@@ -2710,10 +4352,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   Widget _buildMusicPlayerSheet() {
     final track = _currentTrack!;
     final isFav = _favorites.contains(track.path);
-    final topSolid = blendSolid(_accent, _bg, 0.32);
+    final acc = _playerAccent;
+    final topSolid = blendSolid(acc, _bg, 0.34);
     final screenH = MediaQuery.of(context).size.height;
     final screenW = MediaQuery.of(context).size.width;
-    final coverSize = min(305.0, min(screenW * 0.72, screenH * 0.34));
+    final stageSize = min(290.0, min(screenW * 0.70, screenH * 0.32));
     final dark = widget.darkMode;
 
     return GestureDetector(
@@ -2731,7 +4374,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           _openPlayerSheet();
         }
       },
-      child: Container(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 480),
+        curve: Curves.easeOutCubic,
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
@@ -2741,10 +4386,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         child: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 8, 20, 14),
+            padding: const EdgeInsets.fromLTRB(20, 6, 20, 12),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
+                // Cabecera
                 Column(
                   children: [
                     Container(
@@ -2761,8 +4407,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       children: [
                         _buildGlassCircleButton(
                           icon: Icons.keyboard_arrow_down_rounded,
-                          size: 40,
-                          iconSize: 26,
+                          size: 38,
+                          iconSize: 25,
                           onTap: _closePlayerSheet,
                         ),
                         Column(
@@ -2779,13 +4425,20 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                                 padding: const EdgeInsets.only(right: 6),
                                 child: Text(
                                   formatTime(Duration(seconds: _sleepRemainingSec)),
-                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _accent),
+                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: acc),
                                 ),
                               ),
                             _buildGlassCircleButton(
+                              icon: Icons.edit_rounded,
+                              size: 38,
+                              iconSize: 18,
+                              onTap: () => _showEditTrackSheet(track),
+                            ),
+                            const SizedBox(width: 6),
+                            _buildGlassCircleButton(
                               icon: Icons.bedtime_outlined,
-                              size: 40,
-                              iconSize: 20,
+                              size: 38,
+                              iconSize: 19,
                               active: _sleepRemainingSec > 0,
                               onTap: _showSleepTimerDialog,
                             ),
@@ -2796,8 +4449,38 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ],
                 ),
 
-                _buildBigCover(track, coverSize),
+                // Escenario central: Portada / Vinilo girando / Letras (desliza a los lados para cambiar cancion)
+                GestureDetector(
+                  onHorizontalDragEnd: (details) {
+                    if (_showLyricsPanel) return;
+                    final vel = details.primaryVelocity ?? 0;
+                    if (vel < -240) {
+                      HapticFeedback.lightImpact();
+                      _nextTrack();
+                    } else if (vel > 240) {
+                      HapticFeedback.lightImpact();
+                      _prevTrack();
+                    }
+                  },
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 280),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeIn,
+                    child: _showLyricsPanel
+                        ? KeyedSubtree(
+                            key: const ValueKey('lyrics'),
+                            child: _buildLyricsStage(track, stageSize),
+                          )
+                        : KeyedSubtree(
+                            key: ValueKey('art_${_vinylMode}_${track.path}'),
+                            child: _vinylMode
+                                ? _buildVinylDisc(track, stageSize)
+                                : _buildBigCover(track, stageSize),
+                          ),
+                  ),
+                ),
 
+                // Titulo, artista y acciones rapidas
                 Row(
                   children: [
                     Expanded(
@@ -2823,21 +4506,22 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     const SizedBox(width: 8),
                     _buildGlassCircleButton(
                       icon: Icons.playlist_add_rounded,
-                      size: 40,
-                      iconSize: 21,
+                      size: 38,
+                      iconSize: 20,
                       onTap: () => _showAddToPlaylistDialog(track.path),
                     ),
                     const SizedBox(width: 8),
                     _buildGlassCircleButton(
                       icon: isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                      size: 40,
-                      iconSize: 20,
+                      size: 38,
+                      iconSize: 19,
                       active: isFav,
                       onTap: () => _toggleFavorite(track.path),
                     ),
                   ],
                 ),
 
+                // Barra de progreso
                 StreamBuilder<Duration>(
                   stream: _audioPlayer.positionStream,
                   builder: (context, posSnap) {
@@ -2852,10 +4536,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                           data: SliderTheme.of(context).copyWith(
                             trackHeight: 4.5,
                             thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7.5),
-                            activeTrackColor: _accent,
+                            activeTrackColor: acc,
                             inactiveTrackColor: dark ? withA(Colors.white, 0.14) : _border,
                             thumbColor: Colors.white,
-                            overlayColor: withA(_accent, 0.24),
+                            overlayColor: withA(acc, 0.24),
                           ),
                           child: Slider(
                             min: 0.0,
@@ -2889,7 +4573,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   },
                 ),
 
-                // Fila renovada de controles principales con profundidad, brillo y rebote elastico
+                // Controles principales
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   crossAxisAlignment: CrossAxisAlignment.center,
@@ -2911,7 +4595,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       iconSize: 28,
                       onTap: _prevTrack,
                     ),
-                    _buildHeroPlayPauseOrb(size: 74, iconSize: 38),
+                    _buildHeroPlayPauseOrb(size: 72, iconSize: 38),
                     _buildGlassCircleButton(
                       icon: Icons.skip_next_rounded,
                       size: 52,
@@ -2933,23 +4617,55 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ],
                 ),
 
+                // Barra de herramientas rapidas: Ecualizador, Vinilo, Letra, Cola
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    _buildPlayerToolChip(
+                      icon: Icons.equalizer_rounded,
+                      label: 'EQ',
+                      active: _eqEnabled,
+                      onTap: _showEqualizerSheet,
+                    ),
+                    _buildPlayerToolChip(
+                      icon: Icons.album_rounded,
+                      label: 'Vinilo',
+                      active: _vinylMode && !_showLyricsPanel,
+                      onTap: () {
+                        setState(() {
+                          _showLyricsPanel = false;
+                          _vinylMode = !_vinylMode;
+                        });
+                        _syncVinylAnimation();
+                        _savePrefs();
+                      },
+                    ),
+                    _buildPlayerToolChip(
+                      icon: Icons.lyrics_rounded,
+                      label: 'Letra',
+                      active: _showLyricsPanel,
+                      onTap: () => setState(() => _showLyricsPanel = !_showLyricsPanel),
+                    ),
+                    _buildPlayerToolChip(
+                      icon: Icons.queue_music_rounded,
+                      label: 'Cola',
+                      active: false,
+                      onTap: _showQueueBottomSheet,
+                    ),
+                  ],
+                ),
+
                 // Capsula cristalina de velocidad + volumen en vivo
                 Container(
-                  padding: const EdgeInsets.fromLTRB(8, 5, 12, 5),
+                  padding: const EdgeInsets.fromLTRB(8, 4, 12, 4),
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(22),
                     gradient: LinearGradient(
                       begin: Alignment.topLeft,
                       end: Alignment.bottomRight,
                       colors: dark
-                          ? [
-                              withA(Colors.white, 0.10),
-                              withA(Colors.white, 0.03),
-                            ]
-                          : [
-                              withA(Colors.white, 0.85),
-                              withA(Colors.white, 0.55),
-                            ],
+                          ? [withA(Colors.white, 0.10), withA(Colors.white, 0.03)]
+                          : [withA(Colors.white, 0.85), withA(Colors.white, 0.55)],
                     ),
                     border: Border.all(
                       color: dark ? withA(Colors.white, 0.14) : withA(Colors.black, 0.06),
@@ -2962,14 +4678,14 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                           decoration: BoxDecoration(
-                            color: withA(_accent, dark ? 0.22 : 0.14),
+                            color: withA(acc, dark ? 0.22 : 0.14),
                             borderRadius: BorderRadius.circular(14),
-                            border: Border.all(color: withA(_accent, 0.35)),
+                            border: Border.all(color: withA(acc, 0.35)),
                           ),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Icon(Icons.speed_rounded, size: 14, color: _accent),
+                              Icon(Icons.speed_rounded, size: 14, color: acc),
                               const SizedBox(width: 4),
                               Text(
                                 '${_speed == _speed.roundToDouble() ? _speed.toInt() : _speed}x',
@@ -2990,9 +4706,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                           data: SliderTheme.of(context).copyWith(
                             trackHeight: 4,
                             thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
-                            activeTrackColor: _accent,
+                            activeTrackColor: acc,
                             inactiveTrackColor: dark ? withA(Colors.white, 0.14) : _border,
-                            thumbColor: _accent,
+                            thumbColor: acc,
                           ),
                           child: Slider(
                             min: 0.0,
@@ -3025,7 +4741,168 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Reproductor de Video integrado ---
+  Widget _buildPlayerToolChip({
+    required IconData icon,
+    required String label,
+    required bool active,
+    required VoidCallback onTap,
+  }) {
+    final dark = widget.darkMode;
+    final acc = _playerAccent;
+    final fg = active ? (dark ? Colors.white : acc) : _subtext;
+
+    return _SpringPressButton(
+      onTap: onTap,
+      pressedScale: 0.92,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          color: active
+              ? withA(acc, dark ? 0.30 : 0.18)
+              : (dark ? withA(Colors.white, 0.08) : withA(Colors.black, 0.05)),
+          border: Border.all(
+            color: active
+                ? withA(acc, 0.55)
+                : (dark ? withA(Colors.white, 0.12) : withA(Colors.black, 0.06)),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 15, color: fg),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: fg),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --- Reproductor de Video con pantalla completa, doble toque (-10s/+10s) y brillo/volumen al deslizar ---
+
+  Widget _buildVideoGestureSurface(VideoPlayerController? vc, bool initialized) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = max(1.0, constraints.maxWidth);
+        final h = max(1.0, constraints.maxHeight);
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (d) => _videoTapDownX = d.localPosition.dx,
+          onTap: () {
+            if (_videoFullscreen) {
+              setState(() => _videoControlsVisible = !_videoControlsVisible);
+              if (_videoControlsVisible) _scheduleHideVideoControls();
+            } else {
+              _togglePlayPause();
+            }
+          },
+          onDoubleTapDown: (d) => _videoTapDownX = d.localPosition.dx,
+          onDoubleTap: () {
+            if (!initialized || vc == null) return;
+            if (_videoTapDownX < w * 0.42) {
+              final target = vc.value.position - const Duration(seconds: 10);
+              vc.seekTo(target < Duration.zero ? Duration.zero : target);
+              HapticFeedback.lightImpact();
+              _showVideoHud(Icons.replay_10_rounded, '-10 s');
+            } else if (_videoTapDownX > w * 0.58) {
+              final target = vc.value.position + const Duration(seconds: 10);
+              vc.seekTo(target > vc.value.duration ? vc.value.duration : target);
+              HapticFeedback.lightImpact();
+              _showVideoHud(Icons.forward_10_rounded, '+10 s');
+            } else {
+              _togglePlayPause();
+            }
+          },
+          onVerticalDragStart: (d) {
+            _videoDragMode = d.localPosition.dx < (w * 0.5) ? 'brightness' : 'volume';
+          },
+          onVerticalDragUpdate: (d) {
+            final delta = -(d.primaryDelta ?? 0) / max(140.0, h * 0.65);
+            if (_videoDragMode == 'brightness') {
+              final next = (_videoBrightness + delta).clamp(0.15, 1.0);
+              setState(() => _videoBrightness = next);
+              _showVideoHud(Icons.brightness_6_rounded, 'Brillo ${(next * 100).round()}%');
+            } else if (_videoDragMode == 'volume') {
+              final next = (_volume + delta).clamp(0.0, 1.0);
+              setState(() => _volume = next);
+              vc?.setVolume(next);
+              _showVideoHud(
+                next <= 0.01 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                'Volumen ${(next * 100).round()}%',
+              );
+            }
+          },
+          onVerticalDragEnd: (_) {
+            if (_videoDragMode == 'volume') _savePrefs();
+            _videoDragMode = '';
+          },
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: w,
+                height: h,
+                color: Colors.black,
+                alignment: Alignment.center,
+                child: initialized && vc != null
+                    ? AspectRatio(
+                        aspectRatio: vc.value.aspectRatio > 0 ? vc.value.aspectRatio : 16 / 9,
+                        child: VideoPlayer(vc),
+                      )
+                    : CircularProgressIndicator(color: _accent),
+              ),
+              // Filtro suave de brillo al deslizar el lado izquierdo
+              if (_videoBrightness < 0.99)
+                IgnorePointer(
+                  child: Container(
+                    color: withA(Colors.black, (1.0 - _videoBrightness).clamp(0.0, 0.85)),
+                  ),
+                ),
+              // HUD flotante cristalino para gestos (-10s, +10s, Brillo, Volumen)
+              if (_videoHudLabel != null && _videoHudIcon != null)
+                IgnorePointer(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(20),
+                    child: BackdropFilter(
+                      filter: ui.ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
+                        decoration: BoxDecoration(
+                          color: withA(Colors.black, 0.58),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(color: withA(Colors.white, 0.25)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(_videoHudIcon, color: Colors.white, size: 22),
+                            const SizedBox(width: 8),
+                            Text(
+                              _videoHudLabel!,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
   Widget _buildVideoPlayerSheet() {
     final track = _currentTrack!;
@@ -3033,6 +4910,89 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final vc = _videoController;
     final initialized = vc != null && vc.value.isInitialized;
 
+    // Modo pantalla completa horizontal inmersiva
+    if (_videoFullscreen) {
+      return Container(
+        color: Colors.black,
+        child: Stack(
+          children: [
+            Positioned.fill(child: _buildVideoGestureSurface(vc, initialized)),
+            if (_videoControlsVisible)
+              Positioned(
+                top: 12,
+                left: 16,
+                right: 16,
+                child: Row(
+                  children: [
+                    _buildGlassCircleButton(
+                      icon: Icons.fullscreen_exit_rounded,
+                      size: 40,
+                      iconSize: 22,
+                      accentOverride: _accent,
+                      onTap: _exitVideoFullscreen,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        track.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (_videoControlsVisible)
+              Positioned(
+                left: 16,
+                right: 16,
+                bottom: 14,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (initialized)
+                      VideoProgressIndicator(
+                        vc,
+                        allowScrubbing: true,
+                        colors: VideoProgressColors(
+                          playedColor: _accent,
+                          bufferedColor: withA(_accent, 0.35),
+                          backgroundColor: withA(Colors.white, 0.25),
+                        ),
+                      ),
+                    const SizedBox(height: 10),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _buildGlassCircleButton(
+                          icon: Icons.skip_previous_rounded,
+                          size: 42,
+                          iconSize: 24,
+                          accentOverride: _accent,
+                          onTap: _prevTrack,
+                        ),
+                        const SizedBox(width: 16),
+                        _buildHeroPlayPauseOrb(size: 56, iconSize: 30, accentOverride: _accent),
+                        const SizedBox(width: 16),
+                        _buildGlassCircleButton(
+                          icon: Icons.skip_next_rounded,
+                          size: 42,
+                          iconSize: 24,
+                          accentOverride: _accent,
+                          onTap: _nextTrack,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      );
+    }
+
+    // Modo vertical normal con gestos y boton de pantalla completa
     return SafeArea(
       child: Container(
         color: _bg,
@@ -3045,6 +5005,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   icon: Icons.arrow_back_rounded,
                   size: 40,
                   iconSize: 22,
+                  accentOverride: _accent,
                   onTap: _closePlayerSheet,
                 ),
                 const SizedBox(width: 10),
@@ -3061,30 +5022,33 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   size: 40,
                   iconSize: 20,
                   active: isFav,
+                  accentOverride: _accent,
                   onTap: () => _toggleFavorite(track.path),
+                ),
+                const SizedBox(width: 8),
+                _buildGlassCircleButton(
+                  icon: Icons.fullscreen_rounded,
+                  size: 40,
+                  iconSize: 22,
+                  accentOverride: _accent,
+                  onTap: _enterVideoFullscreen,
                 ),
               ],
             ),
             const SizedBox(height: 8),
             Expanded(
-              child: Container(
-                decoration: BoxDecoration(
-                  color: Colors.black,
-                  borderRadius: BorderRadius.circular(18),
-                ),
-                alignment: Alignment.center,
-                child: initialized
-                    ? ClipRRect(
-                        borderRadius: BorderRadius.circular(18),
-                        child: AspectRatio(
-                          aspectRatio: vc.value.aspectRatio > 0 ? vc.value.aspectRatio : 16 / 9,
-                          child: VideoPlayer(vc),
-                        ),
-                      )
-                    : CircularProgressIndicator(color: _accent),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: _buildVideoGestureSurface(vc, initialized),
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 6),
+            Text(
+              'Doble toque a los lados: -10s / +10s   |   Desliza: Brillo (izq) y Volumen (der)',
+              style: TextStyle(fontSize: 10, color: _subtext),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
             if (initialized)
               VideoProgressIndicator(
                 vc,
@@ -3103,23 +5067,26 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   icon: Icons.skip_previous_rounded,
                   size: 46,
                   iconSize: 26,
+                  accentOverride: _accent,
                   onTap: _prevTrack,
                 ),
                 _buildGlassCircleButton(
                   icon: Icons.replay_10_rounded,
                   size: 42,
                   iconSize: 22,
+                  accentOverride: _accent,
                   onTap: () {
                     if (!initialized) return;
                     final target = vc.value.position - const Duration(seconds: 10);
                     vc.seekTo(target < Duration.zero ? Duration.zero : target);
                   },
                 ),
-                _buildHeroPlayPauseOrb(size: 64, iconSize: 34),
+                _buildHeroPlayPauseOrb(size: 64, iconSize: 34, accentOverride: _accent),
                 _buildGlassCircleButton(
                   icon: Icons.forward_10_rounded,
                   size: 42,
                   iconSize: 22,
+                  accentOverride: _accent,
                   onTap: () {
                     if (!initialized) return;
                     final target = vc.value.position + const Duration(seconds: 10);
@@ -3130,6 +5097,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   icon: Icons.skip_next_rounded,
                   size: 46,
                   iconSize: 26,
+                  accentOverride: _accent,
                   onTap: _nextTrack,
                 ),
               ],
