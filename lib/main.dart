@@ -2,25 +2,191 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui';
 
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
+late final RelaxAudioHandler _audioHandler;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.relaxplayer.channel.audio',
-    androidNotificationChannelName: 'relaxPlayer',
-    androidNotificationOngoing: true,
-    androidStopForegroundOnPause: true,
+  _audioHandler = await AudioService.init(
+    builder: () => RelaxAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.relaxplayer.channel.audio',
+      androidNotificationChannelName: 'relaxPlayer',
+      androidNotificationOngoing: false,
+      androidStopForegroundOnPause: false,
+      androidNotificationClickStartsActivity: true,
+    ),
   );
   runApp(const RelaxPlayerApp());
+}
+
+// --- Servicio de audio nativo con controles completos en barra de notificaciones ---
+
+class RelaxAudioHandler extends BaseAudioHandler with SeekHandler {
+  final AudioPlayer player = AudioPlayer();
+
+  Future<void> Function()? onSkipNext;
+  Future<void> Function()? onSkipPrevious;
+  Future<void> Function()? onTrackCompleted;
+
+  bool _completionSent = false;
+
+  RelaxAudioHandler() {
+    player.playbackEventStream.listen(_broadcastState);
+    player.playingStream.listen((_) => _broadcastState(player.playbackEvent));
+    player.processingStateStream.listen((state) {
+      if (state == ProcessingState.completed) {
+        if (!_completionSent) {
+          _completionSent = true;
+          onTrackCompleted?.call();
+        }
+      } else if (state == ProcessingState.ready) {
+        _completionSent = false;
+      }
+      _broadcastState(player.playbackEvent);
+    });
+    player.durationStream.listen((dur) {
+      final current = mediaItem.value;
+      if (current != null && dur != null && dur > Duration.zero && current.duration != dur) {
+        mediaItem.add(current.copyWith(duration: dur));
+      }
+    });
+  }
+
+  Future<void> playMediaTrack({
+    required String path,
+    required String title,
+    required String artist,
+    required String album,
+    Uri? artUri,
+    required double volume,
+    required double speed,
+    required bool repeatOne,
+  }) async {
+    _completionSent = false;
+    mediaItem.add(
+      MediaItem(
+        id: path,
+        title: title,
+        artist: artist,
+        album: album,
+        artUri: artUri,
+      ),
+    );
+    final dur = await player.setFilePath(path);
+    if (dur != null && dur > Duration.zero) {
+      final current = mediaItem.value;
+      if (current != null && current.id == path) {
+        mediaItem.add(current.copyWith(duration: dur));
+      }
+    }
+    await player.setVolume(volume);
+    await player.setSpeed(speed);
+    await player.setLoopMode(repeatOne ? LoopMode.one : LoopMode.off);
+    _broadcastState(player.playbackEvent);
+    await player.play();
+    _broadcastState(player.playbackEvent);
+  }
+
+  void updateCurrentArtwork(String path, {String? title, String? artist, Uri? artUri}) {
+    final current = mediaItem.value;
+    if (current != null && current.id == path) {
+      mediaItem.add(
+        current.copyWith(
+          title: title ?? current.title,
+          artist: artist ?? current.artist,
+          artUri: artUri ?? current.artUri,
+        ),
+      );
+    }
+  }
+
+  void _broadcastState(PlaybackEvent event) {
+    final playing = player.playing;
+    const stateMap = <ProcessingState, AudioProcessingState>{
+      ProcessingState.idle: AudioProcessingState.idle,
+      ProcessingState.loading: AudioProcessingState.loading,
+      ProcessingState.buffering: AudioProcessingState.buffering,
+      ProcessingState.ready: AudioProcessingState.ready,
+      ProcessingState.completed: AudioProcessingState.completed,
+    };
+
+    playbackState.add(
+      playbackState.value.copyWith(
+        controls: [
+          MediaControl.skipToPrevious,
+          playing ? MediaControl.pause : MediaControl.play,
+          MediaControl.skipToNext,
+        ],
+        systemActions: const {
+          MediaAction.seek,
+          MediaAction.seekForward,
+          MediaAction.seekBackward,
+          MediaAction.play,
+          MediaAction.pause,
+          MediaAction.playPause,
+          MediaAction.skipToNext,
+          MediaAction.skipToPrevious,
+          MediaAction.stop,
+        },
+        androidCompactActionIndices: const [0, 1, 2],
+        processingState: stateMap[player.processingState] ?? AudioProcessingState.idle,
+        playing: playing,
+        updatePosition: player.position,
+        bufferedPosition: player.bufferedPosition,
+        speed: player.speed,
+        queueIndex: 0,
+      ),
+    );
+  }
+
+  @override
+  Future<void> play() async {
+    await player.play();
+    _broadcastState(player.playbackEvent);
+  }
+
+  @override
+  Future<void> pause() async {
+    await player.pause();
+    _broadcastState(player.playbackEvent);
+  }
+
+  @override
+  Future<void> seek(Duration position) async {
+    await player.seek(position);
+    _broadcastState(player.playbackEvent);
+  }
+
+  @override
+  Future<void> skipToNext() async {
+    if (onSkipNext != null) {
+      await onSkipNext!();
+    }
+  }
+
+  @override
+  Future<void> skipToPrevious() async {
+    if (onSkipPrevious != null) {
+      await onSkipPrevious!();
+    }
+  }
+
+  @override
+  Future<void> stop() async {
+    await player.stop();
+    await super.stop();
+  }
 }
 
 // --- Constantes y utilidades ---
@@ -184,7 +350,7 @@ class Id3Reader {
         pos += frameSize;
       }
     } catch (_) {
-      // Si un archivo tiene etiquetas danadas, conserva el nombre de archivo sin fallar
+      // Conserva nombre del archivo si el MP3 tiene etiquetas danadas
     } finally {
       try {
         await raf?.close();
@@ -228,7 +394,6 @@ class Id3Reader {
   }
 
   static Uint8List? _extractImageBytes(Uint8List payload) {
-    // Buscar firma JPEG (FF D8 FF) o PNG (89 50 4E 47) dentro del bloque APIC
     final limit = min(payload.length - 4, 256);
     for (int i = 1; i < limit; i++) {
       if (payload[i] == 0xFF && payload[i + 1] == 0xD8 && payload[i + 2] == 0xFF) {
@@ -290,7 +455,7 @@ class _RelaxPlayerAppState extends State<RelaxPlayerApp> {
       SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
         statusBarIconBrightness: _darkMode ? Brightness.light : Brightness.dark,
-        systemNavigationBarColor: _darkMode ? const Color(0xFF15151C) : Colors.white,
+        systemNavigationBarColor: bg,
         systemNavigationBarIconBrightness: _darkMode ? Brightness.light : Brightness.dark,
       ),
     );
@@ -336,7 +501,7 @@ class RelaxHomeScreen extends StatefulWidget {
 
 class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     with SingleTickerProviderStateMixin {
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  AudioPlayer get _audioPlayer => _audioHandler.player;
   VideoPlayerController? _videoController;
 
   late final AnimationController _sheetController;
@@ -381,12 +546,10 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   int _sleepRemainingSec = 0;
   Timer? _clockTimer;
   int _statsAccumSec = 0;
-
-  // Seek drag local para que la barra de tiempo no brinque al arrastrar
   double? _draggingSeekSec;
 
   StreamSubscription<PlayerState>? _playerStateSub;
-  StreamSubscription<int?>? _currentIndexSub;
+  final Random _rng = Random();
 
   Color get _bg => widget.darkMode ? const Color(0xFF0B0B0F) : const Color(0xFFF4F4F8);
   Color get _surface => widget.darkMode ? const Color(0xFF15151C) : const Color(0xFFFFFFFF);
@@ -395,6 +558,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   Color get _subtext => widget.darkMode ? const Color(0xFF9E9EAA) : const Color(0xFF5D5D6B);
   Color get _border => widget.darkMode ? const Color(0xFF282836) : const Color(0xFFDCDCE6);
   Color get _accent => kAccentThemes[widget.accentName] ?? const Color(0xFF9B5DE5);
+
+  double get _bottomScrollClearance {
+    final safeBottom = MediaQuery.of(context).padding.bottom;
+    return safeBottom + (_currentTrack != null ? 168.0 : 96.0);
+  }
 
   @override
   void initState() {
@@ -486,24 +654,22 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   }
 
   void _bindAudioStreams() {
+    // Conectar botones Siguiente / Anterior / Fin de pista de la notificacion
+    _audioHandler.onSkipNext = () async {
+      await _nextTrack();
+    };
+    _audioHandler.onSkipPrevious = () async {
+      await _prevTrack();
+    };
+    _audioHandler.onTrackCompleted = () async {
+      await _nextTrack();
+    };
+
     _playerStateSub = _audioPlayer.playerStateStream.listen((st) {
       if (!mounted) return;
       if (_currentTrack != null && !_currentTrack!.isVideo) {
         if (_isPlaying != st.playing) {
           setState(() => _isPlaying = st.playing);
-        }
-      }
-    });
-
-    // Sincroniza la app cuando cambias de cancion desde la barra de notificaciones
-    _currentIndexSub = _audioPlayer.currentIndexStream.listen((idx) {
-      if (!mounted || idx == null) return;
-      if (_currentTrack != null && _currentTrack!.isVideo) return;
-      if (idx >= 0 && idx < _activeAudioQueue.length) {
-        final nextTrack = _activeAudioQueue[idx];
-        if (_currentTrack?.path != nextTrack.path) {
-          setState(() => _currentTrack = nextTrack);
-          _loadCoverAsync(nextTrack);
         }
       }
     });
@@ -536,8 +702,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   void dispose() {
     _clockTimer?.cancel();
     _playerStateSub?.cancel();
-    _currentIndexSub?.cancel();
-    _audioPlayer.dispose();
+    _audioHandler.onSkipNext = null;
+    _audioHandler.onSkipPrevious = null;
+    _audioHandler.onTrackCompleted = null;
     _videoController?.dispose();
     _sheetController.dispose();
     _musicSearchCtrl.dispose();
@@ -554,13 +721,14 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       SnackBar(
         content: Text(msg, style: const TextStyle(fontFamily: 'Poppins', fontSize: 13)),
         behavior: SnackBarBehavior.floating,
+        margin: EdgeInsets.fromLTRB(16, 0, 16, _currentTrack != null ? 156 : 92),
         duration: const Duration(seconds: 2),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       ),
     );
   }
 
-  // --- Permisos y escaneo automatico de almacenamiento ---
+  // --- Permisos y escaneo automatico ---
 
   Future<void> _requestAndroidPermissions() async {
     if (!Platform.isAndroid) return;
@@ -579,7 +747,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
     List<MediaTrack> found = await _walkMediaDirectories();
 
-    // Si en Android 11+ los permisos normales no devolvieron archivos, pedir acceso completo
     if (found.isEmpty && Platform.isAndroid) {
       final manageStatus = await Permission.manageExternalStorage.status;
       if (!manageStatus.isGranted) {
@@ -743,22 +910,14 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     return _sortList(base, sort);
   }
 
-  // --- Reproduccion de audio (con barra de notificaciones nativa) y video ---
-
-  Future<void> _loadCoverAsync(MediaTrack track) async {
-    if (track.isVideo || track.metadataLoaded) return;
-    await Id3Reader.loadTrackMetadata(track, _cacheDir);
-    if (mounted && _currentTrack?.path == track.path) {
-      setState(() {});
-    }
-  }
+  // --- Reproduccion de audio (con controles completos en notificacion) y video ---
 
   Future<void> _playTrack(MediaTrack track, List<MediaTrack> queue, {bool openSheet = true}) async {
     _totalPlays++;
     _savePrefs();
 
     if (track.isVideo) {
-      await _audioPlayer.pause();
+      await _audioHandler.pause();
       await _disposeVideo();
       _activeVideoQueue = List<MediaTrack>.from(queue.isEmpty ? [track] : queue);
       setState(() {
@@ -785,52 +944,44 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           }
         });
         if (mounted) setState(() => _isPlaying = true);
-      } catch (e) {
+      } catch (_) {
         _showSnack('No se pudo abrir este video.');
       }
       return;
     }
 
-    // Audio con controles en barra de notificaciones + pantalla bloqueada
+    // Audio nativo con controles Anterior / Play-Pausa / Siguiente en la notificacion
     await _disposeVideo();
     await Id3Reader.loadTrackMetadata(track, _cacheDir);
 
     final validQueue = queue.isEmpty ? [track] : List<MediaTrack>.from(queue);
-    final startIdx = max(0, validQueue.indexWhere((t) => t.path == track.path));
     _activeAudioQueue = validQueue;
 
-    setState(() {
-      _currentTrack = track;
-      _isPlaying = true;
-      _draggingSeekSec = null;
-    });
+    if (mounted) {
+      setState(() {
+        _currentTrack = track;
+        _isPlaying = true;
+        _draggingSeekSec = null;
+      });
+    }
     if (openSheet) _openPlayerSheet();
 
     try {
-      final children = validQueue.map((t) {
-        final Uri? art = (t.coverPath != null && File(t.coverPath!).existsSync())
-            ? Uri.file(t.coverPath!)
-            : _defaultLogoUri;
-        return AudioSource.file(
-          t.path,
-          tag: MediaItem(
-            id: t.path,
-            title: t.title,
-            artist: t.artist,
-            album: t.folder,
-            artUri: art,
-          ),
-        );
-      }).toList();
+      final Uri? art = (track.coverPath != null && File(track.coverPath!).existsSync())
+          ? Uri.file(track.coverPath!)
+          : _defaultLogoUri;
 
-      final playlist = ConcatenatingAudioSource(children: children);
-      await _audioPlayer.setAudioSource(playlist, initialIndex: startIdx);
-      await _audioPlayer.setVolume(_volume);
-      await _audioPlayer.setSpeed(_speed);
-      await _audioPlayer.setShuffleModeEnabled(_shuffle);
-      await _audioPlayer.setLoopMode(_repeat ? LoopMode.one : LoopMode.all);
-      await _audioPlayer.play();
-    } catch (e) {
+      await _audioHandler.playMediaTrack(
+        path: track.path,
+        title: track.title,
+        artist: track.artist,
+        album: track.folder,
+        artUri: art,
+        volume: _volume,
+        speed: _speed,
+        repeatOne: _repeat,
+      );
+    } catch (_) {
       if (mounted) {
         setState(() => _isPlaying = false);
         _showSnack('No se pudo reproducir este archivo.');
@@ -852,7 +1003,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     if (_currentTrack!.isVideo) {
       await _videoController?.pause();
     } else {
-      await _audioPlayer.pause();
+      await _audioHandler.pause();
     }
     if (mounted) setState(() => _isPlaying = false);
   }
@@ -876,52 +1027,62 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       setState(() => _isPlaying = vc.value.isPlaying);
     } else {
       if (_audioPlayer.playing) {
-        await _audioPlayer.pause();
+        await _audioHandler.pause();
       } else {
-        await _audioPlayer.play();
+        await _audioHandler.play();
       }
     }
   }
 
   Future<void> _nextTrack() async {
     if (_currentTrack == null) return;
+    final keepSheet = _sheetController.value > 0.5;
+
     if (_currentTrack!.isVideo) {
       if (_activeVideoQueue.isEmpty) return;
       final idx = _activeVideoQueue.indexWhere((t) => t.path == _currentTrack!.path);
       final nextIdx = (idx + 1) % _activeVideoQueue.length;
-      await _playTrack(_activeVideoQueue[nextIdx], _activeVideoQueue, openSheet: _sheetController.value > 0.5);
-    } else {
-      if (_audioPlayer.hasNext) {
-        await _audioPlayer.seekToNext();
-      } else if (_activeAudioQueue.isNotEmpty) {
-        await _audioPlayer.seek(Duration.zero, index: 0);
-      }
-      if (!_audioPlayer.playing) await _audioPlayer.play();
+      await _playTrack(_activeVideoQueue[nextIdx], _activeVideoQueue, openSheet: keepSheet);
+      return;
     }
+
+    if (_activeAudioQueue.isEmpty) return;
+    final curIdx = _activeAudioQueue.indexWhere((t) => t.path == _currentTrack!.path);
+    int nextIdx;
+    if (_shuffle && _activeAudioQueue.length > 1) {
+      do {
+        nextIdx = _rng.nextInt(_activeAudioQueue.length);
+      } while (nextIdx == curIdx);
+    } else {
+      nextIdx = (curIdx + 1) % _activeAudioQueue.length;
+    }
+    await _playTrack(_activeAudioQueue[nextIdx], _activeAudioQueue, openSheet: keepSheet);
   }
 
   Future<void> _prevTrack() async {
     if (_currentTrack == null) return;
+    final keepSheet = _sheetController.value > 0.5;
+
     if (_currentTrack!.isVideo) {
       if (_activeVideoQueue.isEmpty) return;
       final idx = _activeVideoQueue.indexWhere((t) => t.path == _currentTrack!.path);
       final prevIdx = (idx - 1 + _activeVideoQueue.length) % _activeVideoQueue.length;
-      await _playTrack(_activeVideoQueue[prevIdx], _activeVideoQueue, openSheet: _sheetController.value > 0.5);
-    } else {
-      if (_audioPlayer.position.inSeconds > 4) {
-        await _audioPlayer.seek(Duration.zero);
-        return;
-      }
-      if (_audioPlayer.hasPrevious) {
-        await _audioPlayer.seekToPrevious();
-      } else if (_activeAudioQueue.isNotEmpty) {
-        await _audioPlayer.seek(Duration.zero, index: _activeAudioQueue.length - 1);
-      }
-      if (!_audioPlayer.playing) await _audioPlayer.play();
+      await _playTrack(_activeVideoQueue[prevIdx], _activeVideoQueue, openSheet: keepSheet);
+      return;
     }
+
+    if (_audioPlayer.position.inSeconds > 4) {
+      await _audioHandler.seek(Duration.zero);
+      return;
+    }
+
+    if (_activeAudioQueue.isEmpty) return;
+    final curIdx = _activeAudioQueue.indexWhere((t) => t.path == _currentTrack!.path);
+    final prevIdx = (curIdx - 1 + _activeAudioQueue.length) % _activeAudioQueue.length;
+    await _playTrack(_activeAudioQueue[prevIdx], _activeAudioQueue, openSheet: keepSheet);
   }
 
-  // --- Animacion fluida 60 FPS al subir y al bajar (tambien arrastrable con el dedo) ---
+  // --- Animacion fluida 60 FPS al subir y bajar ---
 
   void _openPlayerSheet() {
     if (_currentTrack == null) return;
@@ -936,7 +1097,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     _sheetController.animateBack(0.0, curve: Curves.easeInOutCubic);
   }
 
-  // --- Acciones de favoritos, playlists, velocidad, temporizador ---
+  // --- Favoritos, playlists, velocidad, temporizador ---
 
   void _toggleFavorite(String path) {
     setState(() {
@@ -1126,7 +1287,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Widgets de Logo y Portada (cero fondo blanco roto con audifonos encima) ---
+  // --- Logo y Portada ---
 
   Widget _buildLogoAvatar(double size) {
     if (_hasLogoAsset) {
@@ -1198,10 +1359,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Construccion Principal ---
+  // --- Construccion Principal con Dock Liquid Glass flotando sobre la lista ---
 
   @override
   Widget build(BuildContext context) {
+    final safeBottom = MediaQuery.of(context).padding.bottom;
+
     return AnimatedBuilder(
       animation: _sheetController,
       builder: (context, _) {
@@ -1217,18 +1380,28 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             backgroundColor: _bg,
             body: Stack(
               children: [
-                // Capa 1: Lista principal + mini barra + navegacion inferior
+                // Capa 1: Contenido a pantalla completa (las canciones pasan detras del vidrio liquido)
                 SafeArea(
+                  bottom: false,
+                  child: _buildActiveTabBody(),
+                ),
+
+                // Capa 2: Mini reproductor esmerilado + Barra inferior estilo Liquid Glass flotante
+                Positioned(
+                  left: 14,
+                  right: 14,
+                  bottom: safeBottom + 12,
                   child: Column(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Expanded(child: _buildActiveTabBody()),
-                      if (_currentTrack != null) _buildMiniPlayerBar(),
-                      _buildBottomNav(),
+                      if (_currentTrack != null) _buildMiniPlayerGlass(),
+                      if (_currentTrack != null) const SizedBox(height: 10),
+                      _buildLiquidGlassBottomNav(),
                     ],
                   ),
                 ),
 
-                // Capa 2: Reproductor 100% opaco deslizandose suave a 60 FPS
+                // Capa 3: Reproductor pantalla completa (100% opaco, subida y bajada fluida)
                 if (_currentTrack != null && _sheetController.value > 0.0)
                   FractionalTranslation(
                     translation: Offset(0, 1.0 - _sheetController.value),
@@ -1284,7 +1457,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
       child: Column(
         children: [
-          // Cabecera
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -1322,7 +1494,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           ),
           const SizedBox(height: 10),
 
-          // Buscador
           TextField(
             controller: searchCtrl,
             style: TextStyle(color: _text, fontSize: 14),
@@ -1359,7 +1530,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           ),
           const SizedBox(height: 10),
 
-          // Chips de filtros + playlists
           SizedBox(
             height: 34,
             child: ListView(
@@ -1442,7 +1612,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           ),
           const SizedBox(height: 8),
 
-          // Conteo y ordenamiento
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -1491,12 +1660,11 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           ),
           const SizedBox(height: 6),
 
-          // Lista virtualizada nativa (60 FPS con miles de canciones)
           Expanded(
             child: tracks.isEmpty
                 ? Center(
                     child: Padding(
-                      padding: const EdgeInsets.all(24),
+                      padding: EdgeInsets.fromLTRB(24, 24, 24, _bottomScrollClearance),
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
@@ -1528,7 +1696,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                 : ListView.builder(
                     itemCount: tracks.length,
                     itemExtent: 64,
-                    padding: const EdgeInsets.only(bottom: 10),
+                    padding: EdgeInsets.only(bottom: _bottomScrollClearance),
                     itemBuilder: (_, i) {
                       final t = tracks[i];
                       final isCurrent = _currentTrack?.path == t.path;
@@ -1617,7 +1785,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     if (!_vaultUnlocked) {
       return Center(
         child: Padding(
-          padding: const EdgeInsets.all(28),
+          padding: EdgeInsets.fromLTRB(28, 28, 28, _bottomScrollClearance),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -1669,7 +1837,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final items = _getList(isVideo: isVid, onlyPrivate: true);
 
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
       child: Column(
         children: [
           Row(
@@ -1717,13 +1885,17 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           Expanded(
             child: items.isEmpty
                 ? Center(
-                    child: Text(
-                      'No tienes ${isVid ? 'videos' : 'canciones'} ocultos.',
-                      style: TextStyle(color: _subtext, fontSize: 13),
+                    child: Padding(
+                      padding: EdgeInsets.only(bottom: _bottomScrollClearance),
+                      child: Text(
+                        'No tienes ${isVid ? 'videos' : 'canciones'} ocultos.',
+                        style: TextStyle(color: _subtext, fontSize: 13),
+                      ),
                     ),
                   )
                 : ListView.builder(
                     itemCount: items.length,
+                    padding: EdgeInsets.only(bottom: _bottomScrollClearance),
                     itemBuilder: (_, i) {
                       final t = items[i];
                       return Card(
@@ -1757,7 +1929,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     final nVid = _getList(isVideo: true, onlyPrivate: false).length;
 
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      padding: EdgeInsets.fromLTRB(16, 12, 16, _bottomScrollClearance),
       children: [
         Row(
           children: [
@@ -1768,7 +1940,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 14),
 
-        // Grafico semanal
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -1813,7 +1984,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 12),
 
-        // Apariencia
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -1865,7 +2035,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 12),
 
-        // Cambiar PIN
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -1911,7 +2080,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ),
         const SizedBox(height: 12),
 
-        // Escaneo
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(color: _surface, borderRadius: BorderRadius.circular(18)),
@@ -1938,16 +2106,17 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Mini Reproductor ---
+  // --- Mini Reproductor con efecto cristal a juego ---
 
-  Widget _buildMiniPlayerBar() {
+  Widget _buildMiniPlayerGlass() {
     final track = _currentTrack!;
     final coverFile = (track.coverPath != null) ? File(track.coverPath!) : null;
+    final dark = widget.darkMode;
 
     Widget thumb;
     if (coverFile != null && coverFile.existsSync()) {
       thumb = ClipRRect(
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(12),
         child: Image.file(coverFile, width: 42, height: 42, fit: BoxFit.cover),
       );
     } else if (!track.isVideo && _hasLogoAsset) {
@@ -1955,64 +2124,95 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         width: 42,
         height: 42,
         padding: const EdgeInsets.all(3),
-        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10)),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
         child: Image.asset('assets/logo.png', fit: BoxFit.contain),
       );
     } else {
       thumb = Container(
         width: 42,
         height: 42,
-        decoration: BoxDecoration(color: withA(_accent, 0.2), borderRadius: BorderRadius.circular(10)),
+        decoration: BoxDecoration(color: withA(_accent, 0.25), borderRadius: BorderRadius.circular(12)),
         child: Icon(track.isVideo ? Icons.movie_rounded : Icons.music_note_rounded, color: _accent, size: 22),
       );
     }
 
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 6),
-      child: Material(
-        color: _surfaceAlt,
-        borderRadius: BorderRadius.circular(16),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(16),
-          onTap: _openPlayerSheet,
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(10, 7, 4, 7),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: withA(_accent, 0.35)),
-            ),
-            child: Row(
-              children: [
-                thumb,
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        track.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text),
-                      ),
-                      Text(
-                        track.isVideo ? 'Video - Toca para ver' : track.artist,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 11, color: _subtext),
-                      ),
-                    ],
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(22),
+        boxShadow: [
+          BoxShadow(
+            color: withA(Colors.black, dark ? 0.42 : 0.12),
+            blurRadius: 22,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(22),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: _openPlayerSheet,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(10, 7, 4, 7),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(22),
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: dark
+                        ? [
+                            withA(Colors.white, 0.15),
+                            withA(const Color(0xFF1A1A26), 0.72),
+                            withA(_accent, 0.16),
+                          ]
+                        : [
+                            withA(Colors.white, 0.84),
+                            withA(Colors.white, 0.62),
+                            withA(_accent, 0.12),
+                          ],
+                  ),
+                  border: Border.all(
+                    color: dark ? withA(Colors.white, 0.22) : withA(Colors.white, 0.90),
+                    width: 1.1,
                   ),
                 ),
-                IconButton(
-                  icon: Icon(_isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, color: _text, size: 26),
-                  onPressed: _togglePlayPause,
+                child: Row(
+                  children: [
+                    thumb,
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            track.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _text),
+                          ),
+                          Text(
+                            track.isVideo ? 'Video - Toca para ver' : track.artist,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 11, color: _subtext),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: Icon(_isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, color: _text, size: 26),
+                      onPressed: _togglePlayPause,
+                    ),
+                    IconButton(
+                      icon: Icon(Icons.skip_next_rounded, color: _subtext, size: 24),
+                      onPressed: _nextTrack,
+                    ),
+                  ],
                 ),
-                IconButton(
-                  icon: Icon(Icons.skip_next_rounded, color: _subtext, size: 24),
-                  onPressed: _nextTrack,
-                ),
-              ],
+              ),
             ),
           ),
         ),
@@ -2020,54 +2220,181 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     );
   }
 
-  // --- Barra de navegacion inferior ---
+  // --- Barra de navegacion inferior estilo LIQUID GLASS (capsula flotante + gota deslizante) ---
 
-  Widget _buildBottomNav() {
+  Widget _buildLiquidGlassBottomNav() {
+    final dark = widget.darkMode;
     const items = [
       (0, Icons.music_note_rounded, 'Música'),
       (1, Icons.video_library_rounded, 'Videos'),
       (2, Icons.lock_rounded, 'Privado'),
       (3, Icons.tune_rounded, 'Ajustes'),
     ];
+
     return Container(
+      height: 68,
       decoration: BoxDecoration(
-        color: _surface,
-        border: Border(top: BorderSide(color: _border, width: 1)),
+        borderRadius: BorderRadius.circular(34),
+        boxShadow: [
+          BoxShadow(
+            color: withA(Colors.black, dark ? 0.50 : 0.14),
+            blurRadius: 28,
+            offset: const Offset(0, 12),
+          ),
+          BoxShadow(
+            color: withA(_accent, dark ? 0.16 : 0.10),
+            blurRadius: 20,
+            offset: const Offset(0, 4),
+          ),
+        ],
       ),
-      child: Row(
-        children: items.map((it) {
-          final active = _activeTab == it.$1;
-          return Expanded(
-            child: InkWell(
-              onTap: () => setState(() => _activeTab = it.$1),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 7),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(34),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 26, sigmaY: 26),
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(34),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                stops: const [0.0, 0.45, 1.0],
+                colors: dark
+                    ? [
+                        withA(Colors.white, 0.18),
+                        withA(const Color(0xFF171722), 0.58),
+                        withA(_accent, 0.14),
+                      ]
+                    : [
+                        withA(Colors.white, 0.82),
+                        withA(Colors.white, 0.52),
+                        withA(_accent, 0.12),
+                      ],
+              ),
+              border: Border.all(
+                color: dark ? withA(Colors.white, 0.25) : withA(Colors.white, 0.92),
+                width: 1.25,
+              ),
+            ),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                const padH = 5.0;
+                final innerW = constraints.maxWidth - (padH * 2);
+                final tabW = innerW / items.length;
+
+                return Stack(
                   children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: active ? withA(_accent, 0.18) : Colors.transparent,
-                        borderRadius: BorderRadius.circular(14),
+                    // Brillo especular superior que simula la curvatura del vidrio liquido
+                    Positioned(
+                      top: 0,
+                      left: 24,
+                      right: 24,
+                      height: 1.5,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.transparent,
+                              withA(Colors.white, dark ? 0.50 : 0.95),
+                              Colors.transparent,
+                            ],
+                          ),
+                        ),
                       ),
-                      child: Icon(it.$2, size: 22, color: active ? _accent : _subtext),
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      it.$3,
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: active ? FontWeight.w600 : FontWeight.w400,
-                        color: active ? _accent : _subtext,
+
+                    // Gota / burbuja de vidrio liquido que se desliza suavemente entre pestanas
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeOutCubic,
+                      left: padH + (_activeTab * tabW),
+                      top: 5,
+                      bottom: 5,
+                      width: tabW,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(28),
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: dark
+                                ? [
+                                    withA(_accent, 0.40),
+                                    withA(_accent, 0.18),
+                                  ]
+                                : [
+                                    withA(Colors.white, 0.90),
+                                    withA(_accent, 0.20),
+                                  ],
+                          ),
+                          border: Border.all(
+                            color: dark ? withA(Colors.white, 0.30) : withA(Colors.white, 0.95),
+                            width: 1.0,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: withA(_accent, dark ? 0.30 : 0.18),
+                              blurRadius: 14,
+                              spreadRadius: -2,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                    // Botones de navegacion
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: padH),
+                      child: Row(
+                        children: items.map((it) {
+                          final active = _activeTab == it.$1;
+                          final activeColor = dark ? Colors.white : _accent;
+                          final inactiveColor = dark ? withA(Colors.white, 0.62) : _subtext;
+
+                          return Expanded(
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: () {
+                                if (_activeTab != it.$1) {
+                                  HapticFeedback.selectionClick();
+                                  setState(() => _activeTab = it.$1);
+                                }
+                              },
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  AnimatedScale(
+                                    scale: active ? 1.12 : 1.0,
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutBack,
+                                    child: Icon(
+                                      it.$2,
+                                      size: 22,
+                                      color: active ? activeColor : inactiveColor,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    it.$3,
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                                      color: active ? activeColor : inactiveColor,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        }).toList(),
                       ),
                     ),
                   ],
-                ),
-              ),
+                );
+              },
             ),
-          );
-        }).toList(),
+          ),
+        ),
       ),
     );
   }
@@ -2111,7 +2438,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
             child: Column(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // Cabecera + pastilla deslizable
                 Column(
                   children: [
                     Container(
@@ -2162,10 +2488,8 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ],
                 ),
 
-                // Portada gigante (portada real del MP3 o logo del gatito limpio)
                 _buildBigCover(track, coverSize),
 
-                // Titulo, artista y botones de playlist / favorito
                 Row(
                   children: [
                     Expanded(
@@ -2203,7 +2527,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   ],
                 ),
 
-                // Barra de progreso en vivo (StreamBuilder para cero lag)
                 StreamBuilder<Duration>(
                   stream: _audioPlayer.positionStream,
                   builder: (context, posSnap) {
@@ -2229,7 +2552,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             value: curSec,
                             onChanged: (v) => setState(() => _draggingSeekSec = v),
                             onChangeEnd: (v) async {
-                              await _audioPlayer.seek(Duration(milliseconds: (v * 1000).round()));
+                              await _audioHandler.seek(Duration(milliseconds: (v * 1000).round()));
                               if (mounted) setState(() => _draggingSeekSec = null);
                             },
                           ),
@@ -2255,7 +2578,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                   },
                 ),
 
-                // Controles principales
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
@@ -2263,7 +2585,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       icon: Icon(Icons.shuffle_rounded, size: 23, color: _shuffle ? _accent : _subtext),
                       onPressed: () {
                         setState(() => _shuffle = !_shuffle);
-                        _audioPlayer.setShuffleModeEnabled(_shuffle);
+                        _showSnack(_shuffle ? 'Modo aleatorio activado.' : 'Modo aleatorio desactivado.');
                       },
                     ),
                     IconButton(
@@ -2292,13 +2614,13 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                       icon: Icon(Icons.repeat_rounded, size: 23, color: _repeat ? _accent : _subtext),
                       onPressed: () {
                         setState(() => _repeat = !_repeat);
-                        _audioPlayer.setLoopMode(_repeat ? LoopMode.one : LoopMode.all);
+                        _audioPlayer.setLoopMode(_repeat ? LoopMode.one : LoopMode.off);
+                        _showSnack(_repeat ? 'Repetir canción activado.' : 'Repetir canción desactivado.');
                       },
                     ),
                   ],
                 ),
 
-                // Velocidad + Barra de volumen EN VIVO (cambia al deslizar sin soltar)
                 Row(
                   children: [
                     InkWell(
