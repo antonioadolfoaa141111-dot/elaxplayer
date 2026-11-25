@@ -36,6 +36,59 @@ Future<void> main() async {
   runApp(const RelaxPlayerApp());
 }
 
+// --- Puente nativo para controlar el volumen REAL de Android (AudioManager.STREAM_MUSIC) ---
+
+class SystemVolumeBridge {
+  static const MethodChannel _channel = MethodChannel('com.relaxplayer/volume');
+  static bool available = false;
+
+  static Future<double?> init(void Function(double level) onHardwareVolumeChanged) async {
+    if (!Platform.isAndroid) return null;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'volumeChanged') {
+        final v = (call.arguments as num?)?.toDouble();
+        if (v != null) {
+          onHardwareVolumeChanged(v.clamp(0.0, 1.0));
+        }
+      }
+    });
+    try {
+      final res = await _channel.invokeMethod<num>('getVolume');
+      if (res != null) {
+        available = true;
+        return res.toDouble().clamp(0.0, 1.0);
+      }
+    } catch (_) {
+      available = false;
+    }
+    return null;
+  }
+
+  static Future<bool> setVolume(double v) async {
+    if (!Platform.isAndroid || !available) return false;
+    try {
+      await _channel.invokeMethod('setVolume', {'volume': v.clamp(0.0, 1.0)});
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+class _OnlineStreamCandidate {
+  final String url;
+  final Map<String, String> headers;
+  final String sourceLabel;
+  final bool isHls;
+
+  const _OnlineStreamCandidate({
+    required this.url,
+    required this.headers,
+    required this.sourceLabel,
+    this.isHls = false,
+  });
+}
+
 // --- Servicio de audio nativo + Ecualizador Android + Refuerzo de bajos ---
 
 class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
@@ -253,17 +306,10 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     }
   }
 
-  static const Map<String, String> _streamHeaders = {
-    'User-Agent':
-        'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-    'Referer': 'https://www.youtube.com/',
-    'Origin': 'https://www.youtube.com',
-  };
-
   Future<void> playMediaTrack({
     required String path,
     String? localFilePath,
-    List<String>? sourceUrls,
+    List<_OnlineStreamCandidate>? onlineStreams,
     required String title,
     required String artist,
     required String album,
@@ -293,18 +339,27 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       if (localFilePath != null && localFilePath.isNotEmpty) {
         return target.setFilePath(localFilePath);
       }
-      if (sourceUrls != null && sourceUrls.isNotEmpty) {
+      if (onlineStreams != null && onlineStreams.isNotEmpty) {
         Object? lastErr;
-        for (final url in sourceUrls) {
+        for (final cand in onlineStreams) {
           try {
+            try {
+              await target.stop().timeout(const Duration(seconds: 2));
+            } catch (_) {}
             return await target
-                .setUrl(url, headers: _streamHeaders)
-                .timeout(const Duration(seconds: 10));
+                .setUrl(
+                  cand.url,
+                  headers: cand.headers.isEmpty ? null : cand.headers,
+                )
+                .timeout(const Duration(seconds: 9));
           } catch (e) {
             lastErr = e;
+            try {
+              await target.stop().timeout(const Duration(seconds: 2));
+            } catch (_) {}
           }
         }
-        throw lastErr ?? Exception('No se pudo abrir el stream');
+        throw lastErr ?? Exception('No se pudo abrir el audio en línea');
       }
       return target.setFilePath(path);
     }
@@ -1071,7 +1126,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   List<MediaTrack> _onlineResults = [];
   List<String> _recentOnlineSearches = [];
   Map<String, MediaTrack> _savedOnlineTracks = {};
-  final Map<String, List<yt.StreamInfo>> _streamCandidatesCache = {};
+  final Map<String, List<_OnlineStreamCandidate>> _streamCandidatesCache = {};
   final Map<String, int> _streamUrlExpMs = {};
   bool _searchingOnline = false;
   bool _loadingOnlineTrack = false;
@@ -1186,11 +1241,40 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     _docsDir = docs.path;
     await _prepareLogoAsset();
     await _loadPrefs();
+    final hwVol = await SystemVolumeBridge.init((newLevel) {
+      if (!mounted) return;
+      if ((_volume - newLevel).abs() > 0.01) {
+        setState(() => _volume = newLevel);
+      }
+    });
+    if (hwVol != null && mounted) {
+      setState(() => _volume = hwVol);
+      await _audioHandler.setVolumeLive(1.0);
+    }
     _bindAudioStreams();
     _startClockTimer();
     await _loadCachedLibrary();
     // Escanear en segundo plano sin bloquear el arranque ni borrar la lista guardada
     unawaited(_scanDeviceMedia(showToast: false));
+  }
+
+  double get _effectivePlayerGain => SystemVolumeBridge.available ? 1.0 : _volume;
+
+  void _applyUserVolume(double v, {VideoPlayerController? videoCtrl}) {
+    final clamped = v.clamp(0.0, 1.0);
+    setState(() => _volume = clamped);
+    if (SystemVolumeBridge.available) {
+      unawaited(SystemVolumeBridge.setVolume(clamped));
+      unawaited(_audioHandler.setVolumeLive(1.0));
+      if (videoCtrl != null) {
+        unawaited(videoCtrl.setVolume(1.0));
+      }
+    } else {
+      unawaited(_audioHandler.setVolumeLive(clamped));
+      if (videoCtrl != null) {
+        unawaited(videoCtrl.setVolume(clamped));
+      }
+    }
   }
 
   Future<void> _loadCachedLibrary() async {
@@ -1583,39 +1667,166 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     }
   }
 
-  // --- Buscador y streaming de musica en linea (YouTube Audio con respaldo local) ---
+  // --- Buscador y streaming de musica en linea (Innertube ANDROID_VR / IOS / HLS + sonda rapida) ---
 
-  String? _findCachedOnlineAudioFile(String videoId) {
-    if (_cacheDir.isEmpty) return null;
-    for (final ext in ['m4a', 'webm', 'mp4']) {
-      final f = File('$_cacheDir/yt_audio_$videoId.$ext');
-      if (f.existsSync() && f.lengthSync() > 4096) {
-        return f.path;
-      }
-    }
-    return null;
-  }
-
-  Future<void> _pruneOnlineAudioCache() async {
-    if (_cacheDir.isEmpty) return;
+  Future<bool> _probeStreamCandidate(_OnlineStreamCandidate cand) async {
+    HttpClient? client;
     try {
-      final dir = Directory(_cacheDir);
-      final files = dir
-          .listSync()
-          .whereType<File>()
-          .where((f) => f.path.contains('yt_audio_') && !f.path.endsWith('.part'))
-          .toList();
-      if (files.length <= 12) return;
-      files.sort((a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()));
-      for (int i = 0; i < files.length - 12; i++) {
-        try {
-          await files[i].delete();
-        } catch (_) {}
+      client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 4);
+      final req = await client.getUrl(Uri.parse(cand.url)).timeout(const Duration(seconds: 4));
+      cand.headers.forEach((k, v) => req.headers.set(k, v));
+      if (!cand.isHls) {
+        req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1023');
       }
-    } catch (_) {}
+      final resp = await req.close().timeout(const Duration(seconds: 4));
+      final ok = resp.statusCode == 200 || resp.statusCode == 206;
+      // Cerrar sin descargar el cuerpo completo
+      try {
+        final sub = resp.listen((_) {});
+        await sub.cancel();
+      } catch (_) {}
+      return ok;
+    } catch (_) {
+      return false;
+    } finally {
+      client?.close(force: true);
+    }
   }
 
-  Future<List<yt.StreamInfo>> _resolveOnlineCandidates(MediaTrack track) async {
+  Future<List<_OnlineStreamCandidate>> _fetchInnertubeStreams({
+    required String videoId,
+    required String clientName,
+    required String clientVersion,
+    required String clientIdHeader,
+    required String userAgent,
+    required Map<String, dynamic> extraClientFields,
+  }) async {
+    HttpClient? client;
+    try {
+      client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 6);
+      final uri = Uri.parse('https://www.youtube.com/youtubei/v1/player?prettyPrint=false');
+      final req = await client.postUrl(uri).timeout(const Duration(seconds: 6));
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json; charset=utf-8');
+      req.headers.set(HttpHeaders.userAgentHeader, userAgent);
+      req.headers.set('X-YouTube-Client-Name', clientIdHeader);
+      req.headers.set('X-YouTube-Client-Version', clientVersion);
+
+      final body = jsonEncode({
+        'videoId': videoId,
+        'context': {
+          'client': {
+            'clientName': clientName,
+            'clientVersion': clientVersion,
+            'hl': 'es',
+            'gl': 'US',
+            ...extraClientFields,
+          },
+        },
+        'contentCheckOk': true,
+        'racyCheckOk': true,
+      });
+      req.add(utf8.encode(body));
+
+      final resp = await req.close().timeout(const Duration(seconds: 7));
+      if (resp.statusCode != 200) return [];
+      final raw = await resp.transform(utf8.decoder).join().timeout(const Duration(seconds: 7));
+      final data = jsonDecode(raw);
+      if (data is! Map<String, dynamic>) return [];
+
+      final playability = data['playabilityStatus'];
+      if (playability is Map<String, dynamic>) {
+        final status = playability['status']?.toString() ?? '';
+        if (status != 'OK') {
+          final reason = playability['reason']?.toString();
+          if (reason != null && reason.isNotEmpty) {
+            _lastOnlineDetail = '$clientName: $reason';
+          }
+          return [];
+        }
+      }
+
+      final streamingData = data['streamingData'];
+      if (streamingData is! Map<String, dynamic>) return [];
+
+      final baseHeaders = <String, String>{'User-Agent': userAgent};
+      final mp4Audios = <Map<String, dynamic>>[];
+      final otherAudios = <Map<String, dynamic>>[];
+
+      final adaptive = streamingData['adaptiveFormats'];
+      if (adaptive is List) {
+        for (final item in adaptive) {
+          if (item is! Map<String, dynamic>) continue;
+          final url = item['url']?.toString() ?? '';
+          final mime = (item['mimeType']?.toString() ?? '').toLowerCase();
+          if (url.isEmpty || !mime.startsWith('audio/')) continue;
+          if (mime.contains('mp4')) {
+            mp4Audios.add(item);
+          } else {
+            otherAudios.add(item);
+          }
+        }
+      }
+
+      int bitrateOf(Map<String, dynamic> m) => (m['bitrate'] as num?)?.toInt() ?? 0;
+      mp4Audios.sort((a, b) => bitrateOf(b).compareTo(bitrateOf(a)));
+      otherAudios.sort((a, b) => bitrateOf(b).compareTo(bitrateOf(a)));
+
+      final out = <_OnlineStreamCandidate>[];
+      for (final m in mp4Audios.take(2)) {
+        out.add(_OnlineStreamCandidate(
+          url: m['url'].toString(),
+          headers: baseHeaders,
+          sourceLabel: '$clientName-m4a',
+        ));
+      }
+      for (final m in otherAudios.take(1)) {
+        out.add(_OnlineStreamCandidate(
+          url: m['url'].toString(),
+          headers: baseHeaders,
+          sourceLabel: '$clientName-webm',
+        ));
+      }
+
+      // HLS (.m3u8) nativo de iOS (ExoPlayer lo reproduce directo sin bloqueos 403)
+      final hlsUrl = streamingData['hlsManifestUrl']?.toString() ?? '';
+      if (hlsUrl.isNotEmpty) {
+        out.add(_OnlineStreamCandidate(
+          url: hlsUrl,
+          headers: baseHeaders,
+          sourceLabel: '$clientName-hls',
+          isHls: true,
+        ));
+      }
+
+      // Muxed MP4 como respaldo adicional
+      final formats = streamingData['formats'];
+      if (formats is List && formats.isNotEmpty) {
+        final muxed = formats
+            .whereType<Map<String, dynamic>>()
+            .where((m) => (m['url']?.toString() ?? '').isNotEmpty)
+            .toList()
+          ..sort((a, b) => bitrateOf(a).compareTo(bitrateOf(b)));
+        if (muxed.isNotEmpty) {
+          out.add(_OnlineStreamCandidate(
+            url: muxed.first['url'].toString(),
+            headers: baseHeaders,
+            sourceLabel: '$clientName-muxed',
+          ));
+        }
+      }
+
+      return out;
+    } catch (e) {
+      _lastOnlineDetail = '$clientName: ${e.toString()}';
+      return [];
+    } finally {
+      client?.close(force: true);
+    }
+  }
+
+  Future<List<_OnlineStreamCandidate>> _resolveOnlineCandidates(MediaTrack track) async {
     final vid = track.onlineVideoId;
     if (vid == null || vid.isEmpty) return [];
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -1625,103 +1836,123 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       return cached;
     }
 
-    yt.StreamManifest? manifest;
-    Object? lastErr;
-    for (int attempt = 0; attempt < 2; attempt++) {
-      try {
-        manifest = await _ytClient.videos.streamsClient
-            .getManifest(vid)
-            .timeout(const Duration(seconds: 22));
-        break;
-      } catch (e) {
-        lastErr = e;
-        if (attempt == 0) {
-          try {
-            _ytClient.close();
-          } catch (_) {}
-          _ytClient = yt.YoutubeExplode();
+    final verified = <_OnlineStreamCandidate>[];
+
+    Future<bool> tryClientList(List<_OnlineStreamCandidate> list) async {
+      for (final cand in list) {
+        final ok = await _probeStreamCandidate(cand);
+        if (ok) {
+          verified.add(cand);
+          // Con 1 enlace verificado + posible respaldo HLS ya podemos reproducir al instante
+          if (verified.length >= 2) return true;
         }
       }
+      return verified.isNotEmpty;
     }
 
-    if (manifest == null) {
-      _lastOnlineDetail = 'manifest: ${lastErr.toString()}';
-      return [];
+    // 1) Innertube ANDROID_VR (directo, sin cifrado JS ni PO token, rapidisimo)
+    final vrList = await _fetchInnertubeStreams(
+      videoId: vid,
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      clientIdHeader: '28',
+      userAgent:
+          'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1) gzip',
+      extraClientFields: {
+        'androidSdkVersion': 32,
+        'osName': 'Android',
+        'osVersion': '12',
+        'deviceMake': 'Oculus',
+        'deviceModel': 'Quest 3',
+      },
+    );
+    if (await tryClientList(vrList)) {
+      _streamCandidatesCache[vid] = verified;
+      _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
+      return verified;
     }
 
-    final candidates = <yt.StreamInfo>[];
-    final audioStreams = manifest.audioOnly.toList();
-    if (audioStreams.isNotEmpty) {
-      // Ordenar por bitrate medio-alto primero (arranca rapido en datos moviles)
-      audioStreams.sort((a, b) => b.bitrate.compareTo(a.bitrate));
-      final mp4s = audioStreams
-          .where((s) => s.container.name.toLowerCase() == 'mp4')
-          .toList();
-      final webms = audioStreams
-          .where((s) => s.container.name.toLowerCase() != 'mp4')
-          .toList();
-      if (mp4s.isNotEmpty) candidates.add(mp4s.first);
-      if (webms.isNotEmpty) candidates.add(webms.first);
-      if (mp4s.length > 1) candidates.add(mp4s.last);
+    // 2) Innertube IOS (audio directo + HLS .m3u8)
+    final iosList = await _fetchInnertubeStreams(
+      videoId: vid,
+      clientName: 'IOS',
+      clientVersion: '19.45.4',
+      clientIdHeader: '5',
+      userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+      extraClientFields: {
+        'deviceMake': 'Apple',
+        'deviceModel': 'iPhone16,2',
+        'osName': 'iPhone',
+        'osVersion': '18.1.0.22B83',
+      },
+    );
+    if (await tryClientList(iosList)) {
+      _streamCandidatesCache[vid] = verified;
+      _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
+      return verified;
     }
 
-    if (manifest.muxed.isNotEmpty) {
-      final muxed = manifest.muxed.toList()
-        ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
-      candidates.add(muxed.first);
+    // 3) Innertube ANDROID estandar
+    final androidList = await _fetchInnertubeStreams(
+      videoId: vid,
+      clientName: 'ANDROID',
+      clientVersion: '19.44.38',
+      clientIdHeader: '3',
+      userAgent: 'com.google.android.youtube/19.44.38 (Linux; U; Android 13) gzip',
+      extraClientFields: {
+        'androidSdkVersion': 33,
+        'osName': 'Android',
+        'osVersion': '13',
+      },
+    );
+    if (await tryClientList(androidList)) {
+      _streamCandidatesCache[vid] = verified;
+      _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
+      return verified;
     }
 
-    if (candidates.isNotEmpty) {
-      _streamCandidatesCache[vid] = candidates;
-      _streamUrlExpMs[vid] = now + (60 * 60 * 1000);
-    }
-    return candidates;
-  }
-
-  Future<String?> _downloadOnlineStreamToCache(String videoId, yt.StreamInfo streamInfo) async {
-    if (_cacheDir.isEmpty) return null;
-    final container = streamInfo.container.name.toLowerCase();
-    final ext = container == 'mp4' ? 'm4a' : (container == 'webm' ? 'webm' : 'mp4');
-    final finalPath = '$_cacheDir/yt_audio_$videoId.$ext';
-    final existing = File(finalPath);
-    if (await existing.exists() && await existing.length() > 4096) {
-      return finalPath;
-    }
-
-    final partFile = File('$finalPath.part');
-    IOSink? sink;
+    // 4) Respaldo con youtube_explode_dart (con timeout estricto de 8s, sin Referer web)
     try {
-      sink = partFile.openWrite();
-      int totalBytes = 0;
-      final stream = _ytClient.videos.streamsClient.get(streamInfo);
-      await for (final chunk in stream.timeout(const Duration(seconds: 15))) {
-        sink.add(chunk);
-        totalBytes += chunk.length;
-        if (totalBytes > 28 * 1024 * 1024) {
-          throw Exception('Archivo demasiado grande para caché temporal');
-        }
+      final manifest = await _ytClient.videos.streamsClient
+          .getManifest(vid)
+          .timeout(const Duration(seconds: 8));
+      final expCandidates = <_OnlineStreamCandidate>[];
+      final audioStreams = manifest.audioOnly.toList()
+        ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
+      final mp4s = audioStreams.where((s) => s.container.name.toLowerCase() == 'mp4').toList();
+      if (mp4s.isNotEmpty) {
+        expCandidates.add(_OnlineStreamCandidate(
+          url: mp4s.first.url.toString(),
+          headers: const {},
+          sourceLabel: 'explode-m4a',
+        ));
+      } else if (audioStreams.isNotEmpty) {
+        expCandidates.add(_OnlineStreamCandidate(
+          url: audioStreams.first.url.toString(),
+          headers: const {},
+          sourceLabel: 'explode-audio',
+        ));
       }
-      await sink.flush();
-      await sink.close();
-      sink = null;
-      if (totalBytes < 4096) {
-        if (await partFile.exists()) await partFile.delete();
-        return null;
+      if (manifest.muxed.isNotEmpty) {
+        final muxed = manifest.muxed.toList()..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+        expCandidates.add(_OnlineStreamCandidate(
+          url: muxed.first.url.toString(),
+          headers: const {},
+          sourceLabel: 'explode-muxed',
+        ));
       }
-      if (await existing.exists()) await existing.delete();
-      await partFile.rename(finalPath);
-      unawaited(_pruneOnlineAudioCache());
-      return finalPath;
+      if (await tryClientList(expCandidates)) {
+        _streamCandidatesCache[vid] = verified;
+        _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
+        return verified;
+      }
     } catch (e) {
-      _lastOnlineDetail = 'cache_dl: ${e.toString()}';
-      try {
-        await sink?.close();
-      } catch (_) {}
-      try {
-        if (await partFile.exists()) await partFile.delete();
-      } catch (_) {}
-      return null;
+      _lastOnlineDetail = 'explode: ${e.toString()}';
     }
+
+    // Ultimo recurso: devolver los no sondeados si el probe fallo por red lenta pero si hubo URLs
+    final fallbackRaw = [...vrList, ...iosList, ...androidList].take(3).toList();
+    return fallbackRaw;
   }
 
   Future<void> _downloadRemoteThumb(MediaTrack track) async {
@@ -2136,7 +2367,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       _videoController = ctrl;
       try {
         await ctrl.initialize();
-        await ctrl.setVolume(_volume);
+        await ctrl.setVolume(_effectivePlayerGain);
         await ctrl.play();
         ctrl.addListener(() {
           if (!mounted) return;
@@ -2191,28 +2422,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     unawaited(_loadLyricsForTrack(track));
     if (openSheet) _openPlayerSheet();
 
-    String? cachedLocalFile;
-    List<yt.StreamInfo> onlineCandidates = [];
-    if (track.isOnline) {
-      final vid = track.onlineVideoId ?? '';
-      cachedLocalFile = _findCachedOnlineAudioFile(vid);
-      if (cachedLocalFile == null) {
-        onlineCandidates = await _resolveOnlineCandidates(track);
-        if (reqToken != _playRequestToken) return;
-        if (onlineCandidates.isEmpty) {
-          if (mounted) {
-            setState(() {
-              _loadingOnlineTrack = false;
-              _isPlaying = false;
-            });
-            _syncVinylAnimation();
-            _showSnack('No se encontró un enlace de audio disponible para esta canción.');
-          }
-          return;
-        }
-      }
-    }
-
     Uri? resolveArt(MediaTrack t) {
       if (t.coverPath != null && File(t.coverPath!).existsSync()) {
         return Uri.file(t.coverPath!);
@@ -2235,76 +2444,30 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     }).toList();
 
     try {
-      if (!track.isOnline || cachedLocalFile != null) {
-        await _audioHandler.playMediaTrack(
-          path: track.path,
-          localFilePath: cachedLocalFile,
-          title: track.title,
-          artist: track.artist,
-          album: track.folder,
-          artUri: art,
-          queueItems: mediaQueue,
-          queueIndex: curIdx,
-          volume: _volume,
-          speed: _speed,
-          repeatOne: _repeat,
-          useCrossfade: useCrossfade,
-        );
-      } else {
-        // Intento 1: streaming directo HTTPS probando varios formatos + headers
-        bool started = false;
-        Object? streamErr;
-        try {
-          await _audioHandler.playMediaTrack(
-            path: track.path,
-            sourceUrls: onlineCandidates.map((s) => s.url.toString()).toList(),
-            title: track.title,
-            artist: track.artist,
-            album: track.folder,
-            artUri: art,
-            queueItems: mediaQueue,
-            queueIndex: curIdx,
-            volume: _volume,
-            speed: _speed,
-            repeatOne: _repeat,
-            useCrossfade: useCrossfade,
-          );
-          started = true;
-        } catch (e) {
-          streamErr = e;
-          _lastOnlineDetail = 'stream: ${e.toString()}';
-        }
-
-        // Intento 2 (Respaldo contra bloqueo 403 de YouTube en ExoPlayer):
-        // Descargar el audio temporalmente con el motor de bloques de youtube_explode y reproducirlo local
-        if (!started) {
-          if (reqToken != _playRequestToken) return;
-          final vid = track.onlineVideoId ?? '';
-          String? downloaded;
-          for (final cand in onlineCandidates.take(2)) {
-            downloaded = await _downloadOnlineStreamToCache(vid, cand);
-            if (reqToken != _playRequestToken) return;
-            if (downloaded != null) break;
-          }
-          if (downloaded == null) {
-            throw streamErr ?? Exception('No se pudo obtener el audio');
-          }
-          await _audioHandler.playMediaTrack(
-            path: track.path,
-            localFilePath: downloaded,
-            title: track.title,
-            artist: track.artist,
-            album: track.folder,
-            artUri: art,
-            queueItems: mediaQueue,
-            queueIndex: curIdx,
-            volume: _volume,
-            speed: _speed,
-            repeatOne: _repeat,
-            useCrossfade: useCrossfade,
-          );
+      List<_OnlineStreamCandidate>? onlineStreams;
+      if (track.isOnline) {
+        onlineStreams = await _resolveOnlineCandidates(track)
+            .timeout(const Duration(seconds: 22), onTimeout: () => <_OnlineStreamCandidate>[]);
+        if (reqToken != _playRequestToken) return;
+        if (onlineStreams.isEmpty) {
+          throw Exception(_lastOnlineDetail ?? 'YouTube no entregó enlace de audio');
         }
       }
+
+      await _audioHandler.playMediaTrack(
+        path: track.path,
+        onlineStreams: onlineStreams,
+        title: track.title,
+        artist: track.artist,
+        album: track.folder,
+        artUri: art,
+        queueItems: mediaQueue,
+        queueIndex: curIdx,
+        volume: _effectivePlayerGain,
+        speed: _speed,
+        repeatOne: _repeat,
+        useCrossfade: useCrossfade,
+      );
 
       if (mounted && reqToken == _playRequestToken) {
         setState(() {
@@ -2326,12 +2489,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           _isPlaying = false;
         });
         _syncVinylAnimation();
-        final shortReason = _lastOnlineDetail!.replaceAll('\n', ' ');
+        final shortReason = _lastOnlineDetail!.replaceAll(RegExp(r'\s+'), ' ').trim();
         _showSnack(
           track.isOnline
-              ? 'No se pudo reproducir (${shortReason.length > 55 ? shortReason.substring(0, 55) : shortReason})'
+              ? 'No se pudo reproducir (${shortReason.length > 52 ? shortReason.substring(0, 52) : shortReason})'
               : 'No se pudo reproducir este archivo.',
         );
+      }
+    } finally {
+      if (mounted && reqToken == _playRequestToken && _loadingOnlineTrack) {
+        setState(() => _loadingOnlineTrack = false);
       }
     }
   }
@@ -2359,6 +2526,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   }
 
   Future<void> _togglePlayPause() async {
+    if (_loadingOnlineTrack) {
+      _playRequestToken++;
+      setState(() {
+        _loadingOnlineTrack = false;
+        _isPlaying = false;
+      });
+      _syncVinylAnimation();
+      _showSnack('Carga cancelada.');
+      return;
+    }
     if (_currentTrack == null) {
       final list = _filteredList(_activeTab == 2);
       if (list.isNotEmpty) {
@@ -6283,8 +6460,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                             max: 1.0,
                             value: _volume,
                             onChanged: (v) {
-                              setState(() => _volume = v);
-                              _audioHandler.setVolumeLive(v);
+                              _applyUserVolume(v);
                             },
                             onChangeEnd: (_) => _savePrefs(),
                           ),
@@ -6398,8 +6574,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
               _showVideoHud(Icons.brightness_6_rounded, 'Brillo ${(next * 100).round()}%');
             } else if (_videoDragMode == 'volume') {
               final next = (_volume + delta).clamp(0.0, 1.0);
-              setState(() => _volume = next);
-              vc?.setVolume(next);
+              _applyUserVolume(next, videoCtrl: vc);
               _showVideoHud(
                 next <= 0.01 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
                 'Volumen ${(next * 100).round()}%',
@@ -6682,8 +6857,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
                     activeColor: _accent,
                     inactiveColor: _border,
                     onChanged: (v) {
-                      setState(() => _volume = v);
-                      vc?.setVolume(v);
+                      _applyUserVolume(v, videoCtrl: vc);
                     },
                     onChangeEnd: (_) => _savePrefs(),
                   ),
