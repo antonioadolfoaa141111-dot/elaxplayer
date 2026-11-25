@@ -253,9 +253,17 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     }
   }
 
+  static const Map<String, String> _streamHeaders = {
+    'User-Agent':
+        'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+    'Referer': 'https://www.youtube.com/',
+    'Origin': 'https://www.youtube.com',
+  };
+
   Future<void> playMediaTrack({
     required String path,
-    String? sourceUrl,
+    String? localFilePath,
+    List<String>? sourceUrls,
     required String title,
     required String artist,
     required String album,
@@ -281,9 +289,22 @@ class RelaxAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       artUri: artUri,
     );
 
-    Future<Duration?> loadInto(AudioPlayer target) {
-      if (sourceUrl != null && sourceUrl.isNotEmpty) {
-        return target.setUrl(sourceUrl);
+    Future<Duration?> loadInto(AudioPlayer target) async {
+      if (localFilePath != null && localFilePath.isNotEmpty) {
+        return target.setFilePath(localFilePath);
+      }
+      if (sourceUrls != null && sourceUrls.isNotEmpty) {
+        Object? lastErr;
+        for (final url in sourceUrls) {
+          try {
+            return await target
+                .setUrl(url, headers: _streamHeaders)
+                .timeout(const Duration(seconds: 10));
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        throw lastErr ?? Exception('No se pudo abrir el stream');
       }
       return target.setFilePath(path);
     }
@@ -1034,7 +1055,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
 
   late final AnimationController _sheetController;
   late final AnimationController _vinylController;
-  final yt.YoutubeExplode _ytClient = yt.YoutubeExplode();
+  yt.YoutubeExplode _ytClient = yt.YoutubeExplode();
   final TextEditingController _musicSearchCtrl = TextEditingController();
   final TextEditingController _onlineSearchCtrl = TextEditingController();
   final TextEditingController _videoSearchCtrl = TextEditingController();
@@ -1050,11 +1071,12 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   List<MediaTrack> _onlineResults = [];
   List<String> _recentOnlineSearches = [];
   Map<String, MediaTrack> _savedOnlineTracks = {};
-  final Map<String, String> _streamUrlCache = {};
+  final Map<String, List<yt.StreamInfo>> _streamCandidatesCache = {};
   final Map<String, int> _streamUrlExpMs = {};
   bool _searchingOnline = false;
   bool _loadingOnlineTrack = false;
   String? _onlineError;
+  String? _lastOnlineDetail;
   int _playRequestToken = 0;
 
   MediaTrack? _currentTrack;
@@ -1561,41 +1583,143 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     }
   }
 
-  // --- Buscador y streaming de musica en linea (YouTube Audio) ---
+  // --- Buscador y streaming de musica en linea (YouTube Audio con respaldo local) ---
 
-  Future<String?> _resolveOnlineAudioUrl(MediaTrack track) async {
+  String? _findCachedOnlineAudioFile(String videoId) {
+    if (_cacheDir.isEmpty) return null;
+    for (final ext in ['m4a', 'webm', 'mp4']) {
+      final f = File('$_cacheDir/yt_audio_$videoId.$ext');
+      if (f.existsSync() && f.lengthSync() > 4096) {
+        return f.path;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _pruneOnlineAudioCache() async {
+    if (_cacheDir.isEmpty) return;
+    try {
+      final dir = Directory(_cacheDir);
+      final files = dir
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.contains('yt_audio_') && !f.path.endsWith('.part'))
+          .toList();
+      if (files.length <= 12) return;
+      files.sort((a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()));
+      for (int i = 0; i < files.length - 12; i++) {
+        try {
+          await files[i].delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  Future<List<yt.StreamInfo>> _resolveOnlineCandidates(MediaTrack track) async {
     final vid = track.onlineVideoId;
-    if (vid == null || vid.isEmpty) return null;
+    if (vid == null || vid.isEmpty) return [];
     final now = DateTime.now().millisecondsSinceEpoch;
-    final cachedUrl = _streamUrlCache[vid];
+    final cached = _streamCandidatesCache[vid];
     final exp = _streamUrlExpMs[vid] ?? 0;
-    if (cachedUrl != null && now < exp) {
-      return cachedUrl;
+    if (cached != null && cached.isNotEmpty && now < exp) {
+      return cached;
     }
 
-    try {
-      final manifest = await _ytClient.videos.streamsClient
-          .getManifest(vid)
-          .timeout(const Duration(seconds: 15));
-      yt.StreamInfo? chosen;
-      final audioStreams = manifest.audioOnly.toList();
-      if (audioStreams.isNotEmpty) {
-        audioStreams.sort((a, b) => b.bitrate.compareTo(a.bitrate));
-        final mp4s = audioStreams
-            .where((s) => s.container.name.toLowerCase() == 'mp4')
-            .toList();
-        chosen = mp4s.isNotEmpty ? mp4s.first : audioStreams.first;
-      } else if (manifest.muxed.isNotEmpty) {
-        final muxed = manifest.muxed.toList()
-          ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
-        chosen = muxed.first;
+    yt.StreamManifest? manifest;
+    Object? lastErr;
+    for (int attempt = 0; attempt < 2; attempt++) {
+      try {
+        manifest = await _ytClient.videos.streamsClient
+            .getManifest(vid)
+            .timeout(const Duration(seconds: 22));
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (attempt == 0) {
+          try {
+            _ytClient.close();
+          } catch (_) {}
+          _ytClient = yt.YoutubeExplode();
+        }
       }
-      if (chosen == null) return null;
-      final urlStr = chosen.url.toString();
-      _streamUrlCache[vid] = urlStr;
-      _streamUrlExpMs[vid] = now + (90 * 60 * 1000);
-      return urlStr;
-    } catch (_) {
+    }
+
+    if (manifest == null) {
+      _lastOnlineDetail = 'manifest: ${lastErr.toString()}';
+      return [];
+    }
+
+    final candidates = <yt.StreamInfo>[];
+    final audioStreams = manifest.audioOnly.toList();
+    if (audioStreams.isNotEmpty) {
+      // Ordenar por bitrate medio-alto primero (arranca rapido en datos moviles)
+      audioStreams.sort((a, b) => b.bitrate.compareTo(a.bitrate));
+      final mp4s = audioStreams
+          .where((s) => s.container.name.toLowerCase() == 'mp4')
+          .toList();
+      final webms = audioStreams
+          .where((s) => s.container.name.toLowerCase() != 'mp4')
+          .toList();
+      if (mp4s.isNotEmpty) candidates.add(mp4s.first);
+      if (webms.isNotEmpty) candidates.add(webms.first);
+      if (mp4s.length > 1) candidates.add(mp4s.last);
+    }
+
+    if (manifest.muxed.isNotEmpty) {
+      final muxed = manifest.muxed.toList()
+        ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+      candidates.add(muxed.first);
+    }
+
+    if (candidates.isNotEmpty) {
+      _streamCandidatesCache[vid] = candidates;
+      _streamUrlExpMs[vid] = now + (60 * 60 * 1000);
+    }
+    return candidates;
+  }
+
+  Future<String?> _downloadOnlineStreamToCache(String videoId, yt.StreamInfo streamInfo) async {
+    if (_cacheDir.isEmpty) return null;
+    final container = streamInfo.container.name.toLowerCase();
+    final ext = container == 'mp4' ? 'm4a' : (container == 'webm' ? 'webm' : 'mp4');
+    final finalPath = '$_cacheDir/yt_audio_$videoId.$ext';
+    final existing = File(finalPath);
+    if (await existing.exists() && await existing.length() > 4096) {
+      return finalPath;
+    }
+
+    final partFile = File('$finalPath.part');
+    IOSink? sink;
+    try {
+      sink = partFile.openWrite();
+      int totalBytes = 0;
+      final stream = _ytClient.videos.streamsClient.get(streamInfo);
+      await for (final chunk in stream.timeout(const Duration(seconds: 15))) {
+        sink.add(chunk);
+        totalBytes += chunk.length;
+        if (totalBytes > 28 * 1024 * 1024) {
+          throw Exception('Archivo demasiado grande para caché temporal');
+        }
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      if (totalBytes < 4096) {
+        if (await partFile.exists()) await partFile.delete();
+        return null;
+      }
+      if (await existing.exists()) await existing.delete();
+      await partFile.rename(finalPath);
+      unawaited(_pruneOnlineAudioCache());
+      return finalPath;
+    } catch (e) {
+      _lastOnlineDetail = 'cache_dl: ${e.toString()}';
+      try {
+        await sink?.close();
+      } catch (_) {}
+      try {
+        if (await partFile.exists()) await partFile.delete();
+      } catch (_) {}
       return null;
     }
   }
@@ -1658,7 +1782,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     if (curIdx < 0) return;
     final nextTrack = _activeAudioQueue[(curIdx + 1) % _activeAudioQueue.length];
     if (nextTrack.isOnline) {
-      unawaited(_resolveOnlineAudioUrl(nextTrack));
+      unawaited(_resolveOnlineCandidates(nextTrack));
       unawaited(_downloadRemoteThumb(nextTrack));
     }
   }
@@ -2067,77 +2191,146 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     unawaited(_loadLyricsForTrack(track));
     if (openSheet) _openPlayerSheet();
 
-    String? streamUrl;
+    String? cachedLocalFile;
+    List<yt.StreamInfo> onlineCandidates = [];
     if (track.isOnline) {
-      streamUrl = await _resolveOnlineAudioUrl(track);
-      if (reqToken != _playRequestToken) return;
-      if (streamUrl == null) {
-        if (mounted) {
-          setState(() {
-            _loadingOnlineTrack = false;
-            _isPlaying = false;
-          });
-          _syncVinylAnimation();
-          _showSnack('No se pudo cargar el audio en línea. Revisa tu conexión.');
+      final vid = track.onlineVideoId ?? '';
+      cachedLocalFile = _findCachedOnlineAudioFile(vid);
+      if (cachedLocalFile == null) {
+        onlineCandidates = await _resolveOnlineCandidates(track);
+        if (reqToken != _playRequestToken) return;
+        if (onlineCandidates.isEmpty) {
+          if (mounted) {
+            setState(() {
+              _loadingOnlineTrack = false;
+              _isPlaying = false;
+            });
+            _syncVinylAnimation();
+            _showSnack('No se encontró un enlace de audio disponible para esta canción.');
+          }
+          return;
         }
-        return;
       }
     }
 
+    Uri? resolveArt(MediaTrack t) {
+      if (t.coverPath != null && File(t.coverPath!).existsSync()) {
+        return Uri.file(t.coverPath!);
+      }
+      if (t.remoteArtUrl != null && t.remoteArtUrl!.isNotEmpty) {
+        return Uri.tryParse(t.remoteArtUrl!) ?? _defaultLogoUri;
+      }
+      return _defaultLogoUri;
+    }
+
+    final Uri? art = resolveArt(track);
+    final mediaQueue = validQueue.map((t) {
+      return MediaItem(
+        id: t.path,
+        title: t.title,
+        artist: t.artist,
+        album: t.folder,
+        artUri: resolveArt(t),
+      );
+    }).toList();
+
     try {
-      Uri? resolveArt(MediaTrack t) {
-        if (t.coverPath != null && File(t.coverPath!).existsSync()) {
-          return Uri.file(t.coverPath!);
+      if (!track.isOnline || cachedLocalFile != null) {
+        await _audioHandler.playMediaTrack(
+          path: track.path,
+          localFilePath: cachedLocalFile,
+          title: track.title,
+          artist: track.artist,
+          album: track.folder,
+          artUri: art,
+          queueItems: mediaQueue,
+          queueIndex: curIdx,
+          volume: _volume,
+          speed: _speed,
+          repeatOne: _repeat,
+          useCrossfade: useCrossfade,
+        );
+      } else {
+        // Intento 1: streaming directo HTTPS probando varios formatos + headers
+        bool started = false;
+        Object? streamErr;
+        try {
+          await _audioHandler.playMediaTrack(
+            path: track.path,
+            sourceUrls: onlineCandidates.map((s) => s.url.toString()).toList(),
+            title: track.title,
+            artist: track.artist,
+            album: track.folder,
+            artUri: art,
+            queueItems: mediaQueue,
+            queueIndex: curIdx,
+            volume: _volume,
+            speed: _speed,
+            repeatOne: _repeat,
+            useCrossfade: useCrossfade,
+          );
+          started = true;
+        } catch (e) {
+          streamErr = e;
+          _lastOnlineDetail = 'stream: ${e.toString()}';
         }
-        if (t.remoteArtUrl != null && t.remoteArtUrl!.isNotEmpty) {
-          return Uri.tryParse(t.remoteArtUrl!) ?? _defaultLogoUri;
+
+        // Intento 2 (Respaldo contra bloqueo 403 de YouTube en ExoPlayer):
+        // Descargar el audio temporalmente con el motor de bloques de youtube_explode y reproducirlo local
+        if (!started) {
+          if (reqToken != _playRequestToken) return;
+          final vid = track.onlineVideoId ?? '';
+          String? downloaded;
+          for (final cand in onlineCandidates.take(2)) {
+            downloaded = await _downloadOnlineStreamToCache(vid, cand);
+            if (reqToken != _playRequestToken) return;
+            if (downloaded != null) break;
+          }
+          if (downloaded == null) {
+            throw streamErr ?? Exception('No se pudo obtener el audio');
+          }
+          await _audioHandler.playMediaTrack(
+            path: track.path,
+            localFilePath: downloaded,
+            title: track.title,
+            artist: track.artist,
+            album: track.folder,
+            artUri: art,
+            queueItems: mediaQueue,
+            queueIndex: curIdx,
+            volume: _volume,
+            speed: _speed,
+            repeatOne: _repeat,
+            useCrossfade: useCrossfade,
+          );
         }
-        return _defaultLogoUri;
       }
 
-      final Uri? art = resolveArt(track);
-      final mediaQueue = validQueue.map((t) {
-        return MediaItem(
-          id: t.path,
-          title: t.title,
-          artist: t.artist,
-          album: t.folder,
-          artUri: resolveArt(t),
-        );
-      }).toList();
-
-      await _audioHandler.playMediaTrack(
-        path: track.path,
-        sourceUrl: streamUrl,
-        title: track.title,
-        artist: track.artist,
-        album: track.folder,
-        artUri: art,
-        queueItems: mediaQueue,
-        queueIndex: curIdx,
-        volume: _volume,
-        speed: _speed,
-        repeatOne: _repeat,
-        useCrossfade: useCrossfade,
-      );
       if (mounted && reqToken == _playRequestToken) {
         setState(() {
           _loadingOnlineTrack = false;
           _isPlaying = true;
+          _lastOnlineDetail = null;
         });
         _syncVinylAnimation();
       }
       unawaited(_applySavedEqualizer());
-    } catch (_) {
+    } catch (e) {
+      if (track.isOnline && track.onlineVideoId != null) {
+        _streamCandidatesCache.remove(track.onlineVideoId);
+      }
+      _lastOnlineDetail = e.toString();
       if (mounted && reqToken == _playRequestToken) {
         setState(() {
           _loadingOnlineTrack = false;
           _isPlaying = false;
         });
         _syncVinylAnimation();
+        final shortReason = _lastOnlineDetail!.replaceAll('
+', ' ');
         _showSnack(
           track.isOnline
-              ? 'No se pudo reproducir esta canción en línea.'
+              ? 'No se pudo reproducir (${shortReason.length > 55 ? shortReason.substring(0, 55) : shortReason})'
               : 'No se pudo reproducir este archivo.',
         );
       }
