@@ -2326,8 +2326,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
           _isPlaying = false;
         });
         _syncVinylAnimation();
-        final shortReason = _lastOnlineDetail!.replaceAll('
-', ' ');
+        final shortReason = _lastOnlineDetail!.replaceAll('\n', ' ');
         _showSnack(
           track.isOnline
               ? 'No se pudo reproducir (${shortReason.length > 55 ? shortReason.substring(0, 55) : shortReason})'
