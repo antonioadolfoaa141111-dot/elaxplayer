@@ -39,7 +39,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-SemiBold.ttf -o assets/fonts/Poppins-SemiBold.ttf
           curl -fsSL https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Bold.ttf -o assets/fonts/Poppins-Bold.ttf
 
-      - name: Generar estructura Android y recursos de notificacion
+      - name: Generar estructura Android, volumen nativo y recursos de notificacion
         run: |
           cp pubspec.yaml pubspec.yaml.bak
           cp lib/main.dart lib/main.dart.bak
@@ -47,6 +47,94 @@ jobs:
           mv pubspec.yaml.bak pubspec.yaml
           mv lib/main.dart.bak lib/main.dart
           cp android_manifest.xml android/app/src/main/AndroidManifest.xml
+
+          # Usar MainActivity (que hereda AudioServiceActivity) para controlar el volumen real del sistema
+          sed -i 's/com.ryanheise.audioservice.AudioServiceActivity/.MainActivity/g' android/app/src/main/AndroidManifest.xml
+
+          MAIN_ACT=$(find android/app/src/main/kotlin -name "MainActivity.kt" | head -n 1 || true)
+          if [ -n "$MAIN_ACT" ]; then
+            PKG_LINE=$(head -n 1 "$MAIN_ACT")
+            cat << EOF > "$MAIN_ACT"
+          $PKG_LINE
+
+          import android.content.Context
+          import android.database.ContentObserver
+          import android.media.AudioManager
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import com.ryanheise.audioservice.AudioServiceActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import kotlin.math.roundToInt
+
+          class MainActivity : AudioServiceActivity() {
+              private var volumeObserver: ContentObserver? = null
+              private var volumeChannel: MethodChannel? = null
+              private var lastReportedVol: Int = -1
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.relaxplayer/volume")
+                  volumeChannel = channel
+
+                  fun currentNormalized(): Double {
+                      val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                      val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                      return (curVol.toDouble() / maxVol.toDouble()).coerceIn(0.0, 1.0)
+                  }
+
+                  channel.setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "getVolume" -> {
+                              result.success(currentNormalized())
+                          }
+                          "setVolume" -> {
+                              val v = (call.argument<Number>("volume")?.toDouble() ?: 0.5).coerceIn(0.0, 1.0)
+                              val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                              val target = (v * maxVol).roundToInt().coerceIn(0, maxVol)
+                              lastReportedVol = target
+                              audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                              result.success(target.toDouble() / maxVol.toDouble())
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+
+                  val handler = Handler(Looper.getMainLooper())
+                  volumeObserver?.let {
+                      try {
+                          contentResolver.unregisterContentObserver(it)
+                      } catch (_: Exception) {}
+                  }
+                  val observer = object : ContentObserver(handler) {
+                      override fun onChange(selfChange: Boolean) {
+                          super.onChange(selfChange)
+                          val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                          if (curVol != lastReportedVol) {
+                              lastReportedVol = curVol
+                              volumeChannel?.invokeMethod("volumeChanged", currentNormalized())
+                          }
+                      }
+                  }
+                  volumeObserver = observer
+                  contentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, observer)
+              }
+
+              override fun onDestroy() {
+                  volumeObserver?.let {
+                      try {
+                          contentResolver.unregisterContentObserver(it)
+                      } catch (_: Exception) {}
+                  }
+                  volumeObserver = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+            echo "MainActivity.kt actualizado en $MAIN_ACT"
+          fi
 
           # Desactivar tareas de Android Lint que se traban en plugins como image_picker_android
           if [ -f android/build.gradle.kts ]; then
