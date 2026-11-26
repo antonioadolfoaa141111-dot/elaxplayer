@@ -1132,6 +1132,7 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
   bool _loadingOnlineTrack = false;
   String? _onlineError;
   String? _lastOnlineDetail;
+  String? _ytVisitorData;
   int _playRequestToken = 0;
 
   MediaTrack? _currentTrack;
@@ -1667,7 +1668,69 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     }
   }
 
-  // --- Buscador y streaming de musica en linea (Innertube ANDROID_VR / IOS / HLS + sonda rapida) ---
+  // --- Buscador y streaming de musica en linea (3 capas rapidas + cache temporal) ---
+
+  String? _findCachedOnlineAudioFile(String videoId) {
+    if (_cacheDir.isEmpty || videoId.isEmpty) return null;
+    for (final ext in ['m4a', 'webm', 'mp4']) {
+      final f = File('$_cacheDir/yt_audio_$videoId.$ext');
+      if (f.existsSync() && f.lengthSync() > 4096) {
+        return f.path;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _pruneOnlineAudioCache() async {
+    if (_cacheDir.isEmpty) return;
+    try {
+      final dir = Directory(_cacheDir);
+      final files = dir
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.contains('yt_audio_') && !f.path.endsWith('.part'))
+          .toList();
+      if (files.length <= 12) return;
+      files.sort((a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()));
+      for (int i = 0; i < files.length - 12; i++) {
+        try {
+          await files[i].delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  Future<String?> _ensureVisitorData() async {
+    if (_ytVisitorData != null && _ytVisitorData!.isNotEmpty) {
+      return _ytVisitorData;
+    }
+    HttpClient? client;
+    try {
+      client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 4);
+      final req = await client
+          .getUrl(Uri.parse('https://www.youtube.com/sw.js_data'))
+          .timeout(const Duration(seconds: 4));
+      req.headers.set(
+        HttpHeaders.userAgentHeader,
+        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+      );
+      final resp = await req.close().timeout(const Duration(seconds: 4));
+      if (resp.statusCode == 200) {
+        final raw = await resp.transform(utf8.decoder).join().timeout(const Duration(seconds: 4));
+        // Buscar token visitorData (formato Cgt... base64 urlsafe)
+        final m = RegExp(r'"(Cg[A-Za-z0-9_\-%]{14,})"').firstMatch(raw);
+        if (m != null) {
+          _ytVisitorData = m.group(1);
+          return _ytVisitorData;
+        }
+      }
+    } catch (_) {
+    } finally {
+      client?.close(force: true);
+    }
+    return null;
+  }
 
   Future<bool> _probeStreamCandidate(_OnlineStreamCandidate cand) async {
     HttpClient? client;
@@ -1681,7 +1744,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       }
       final resp = await req.close().timeout(const Duration(seconds: 4));
       final ok = resp.statusCode == 200 || resp.statusCode == 206;
-      // Cerrar sin descargar el cuerpo completo
       try {
         final sub = resp.listen((_) {});
         await sub.cancel();
@@ -1701,6 +1763,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     required String clientIdHeader,
     required String userAgent,
     required Map<String, dynamic> extraClientFields,
+    Map<String, dynamic>? extraContext,
+    String? visitorData,
+    List<String>? diag,
   }) async {
     HttpClient? client;
     try {
@@ -1712,25 +1777,39 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       req.headers.set(HttpHeaders.userAgentHeader, userAgent);
       req.headers.set('X-YouTube-Client-Name', clientIdHeader);
       req.headers.set('X-YouTube-Client-Version', clientVersion);
+      if (visitorData != null && visitorData.isNotEmpty) {
+        req.headers.set('X-Goog-Visitor-Id', visitorData);
+      }
+
+      final clientMap = <String, dynamic>{
+        'clientName': clientName,
+        'clientVersion': clientVersion,
+        'hl': 'es',
+        'gl': 'US',
+        ...extraClientFields,
+      };
+      if (visitorData != null && visitorData.isNotEmpty) {
+        clientMap['visitorData'] = visitorData;
+      }
+
+      final contextMap = <String, dynamic>{
+        'client': clientMap,
+        if (extraContext != null) ...extraContext,
+      };
 
       final body = jsonEncode({
         'videoId': videoId,
-        'context': {
-          'client': {
-            'clientName': clientName,
-            'clientVersion': clientVersion,
-            'hl': 'es',
-            'gl': 'US',
-            ...extraClientFields,
-          },
-        },
+        'context': contextMap,
         'contentCheckOk': true,
         'racyCheckOk': true,
       });
       req.add(utf8.encode(body));
 
       final resp = await req.close().timeout(const Duration(seconds: 7));
-      if (resp.statusCode != 200) return [];
+      if (resp.statusCode != 200) {
+        diag?.add('$clientName:HTTP${resp.statusCode}');
+        return [];
+      }
       final raw = await resp.transform(utf8.decoder).join().timeout(const Duration(seconds: 7));
       final data = jsonDecode(raw);
       if (data is! Map<String, dynamic>) return [];
@@ -1739,16 +1818,16 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       if (playability is Map<String, dynamic>) {
         final status = playability['status']?.toString() ?? '';
         if (status != 'OK') {
-          final reason = playability['reason']?.toString();
-          if (reason != null && reason.isNotEmpty) {
-            _lastOnlineDetail = '$clientName: $reason';
-          }
+          diag?.add('$clientName:$status');
           return [];
         }
       }
 
       final streamingData = data['streamingData'];
-      if (streamingData is! Map<String, dynamic>) return [];
+      if (streamingData is! Map<String, dynamic>) {
+        diag?.add('$clientName:noData');
+        return [];
+      }
 
       final baseHeaders = <String, String>{'User-Agent': userAgent};
       final mp4Audios = <Map<String, dynamic>>[];
@@ -1789,7 +1868,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ));
       }
 
-      // HLS (.m3u8) nativo de iOS (ExoPlayer lo reproduce directo sin bloqueos 403)
       final hlsUrl = streamingData['hlsManifestUrl']?.toString() ?? '';
       if (hlsUrl.isNotEmpty) {
         out.add(_OnlineStreamCandidate(
@@ -1800,7 +1878,6 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         ));
       }
 
-      // Muxed MP4 como respaldo adicional
       final formats = streamingData['formats'];
       if (formats is List && formats.isNotEmpty) {
         final muxed = formats
@@ -1817,16 +1894,177 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
         }
       }
 
+      if (out.isEmpty) {
+        diag?.add('$clientName:cipherOnly');
+      }
       return out;
-    } catch (e) {
-      _lastOnlineDetail = '$clientName: ${e.toString()}';
+    } catch (_) {
+      diag?.add('$clientName:err');
       return [];
     } finally {
       client?.close(force: true);
     }
   }
 
-  Future<List<_OnlineStreamCandidate>> _resolveOnlineCandidates(MediaTrack track) async {
+  Future<List<_OnlineStreamCandidate>> _fetchFromPublicMirrors(
+    String videoId,
+    List<String> diag,
+  ) async {
+    const pipedHosts = [
+      'https://pipedapi.kavin.rocks',
+      'https://api.piped.private.coffee',
+      'https://pipedapi.adminforge.de',
+      'https://pipedapi.leptons.xyz',
+    ];
+    const invidiousHosts = [
+      'https://inv.nadeko.net',
+      'https://yewtu.be',
+    ];
+
+    Future<List<_OnlineStreamCandidate>> queryPiped(String host) async {
+      HttpClient? client;
+      try {
+        client = HttpClient();
+        client.connectionTimeout = const Duration(seconds: 4);
+        final req = await client
+            .getUrl(Uri.parse('$host/streams/$videoId'))
+            .timeout(const Duration(seconds: 4));
+        req.headers.set(HttpHeaders.userAgentHeader, 'relaxPlayer/2.4');
+        final resp = await req.close().timeout(const Duration(seconds: 5));
+        if (resp.statusCode != 200) return [];
+        final raw = await resp.transform(utf8.decoder).join().timeout(const Duration(seconds: 5));
+        final data = jsonDecode(raw);
+        if (data is! Map<String, dynamic>) return [];
+        final streams = data['audioStreams'];
+        if (streams is! List) return [];
+        final parsed = streams
+            .whereType<Map<String, dynamic>>()
+            .where((m) => (m['url']?.toString() ?? '').startsWith('http'))
+            .toList();
+        if (parsed.isEmpty) return [];
+        parsed.sort((a, b) => ((b['bitrate'] as num?)?.toInt() ?? 0)
+            .compareTo(((a['bitrate'] as num?)?.toInt() ?? 0)));
+        final mp4s = parsed
+            .where((m) => (m['mimeType']?.toString() ?? '').toLowerCase().contains('mp4'))
+            .toList();
+        final chosen = mp4s.isNotEmpty ? mp4s.take(2).toList() : parsed.take(2).toList();
+        return chosen
+            .map((m) => _OnlineStreamCandidate(
+                  url: m['url'].toString(),
+                  headers: const {},
+                  sourceLabel: 'piped',
+                ))
+            .toList();
+      } catch (_) {
+        return [];
+      } finally {
+        client?.close(force: true);
+      }
+    }
+
+    Future<List<_OnlineStreamCandidate>> queryInvidious(String host) async {
+      HttpClient? client;
+      try {
+        client = HttpClient();
+        client.connectionTimeout = const Duration(seconds: 4);
+        final req = await client
+            .getUrl(Uri.parse('$host/api/v1/videos/$videoId?fields=adaptiveFormats'))
+            .timeout(const Duration(seconds: 4));
+        req.headers.set(HttpHeaders.userAgentHeader, 'relaxPlayer/2.4');
+        final resp = await req.close().timeout(const Duration(seconds: 5));
+        if (resp.statusCode != 200) return [];
+        final raw = await resp.transform(utf8.decoder).join().timeout(const Duration(seconds: 5));
+        final data = jsonDecode(raw);
+        if (data is! Map<String, dynamic>) return [];
+        final adaptive = data['adaptiveFormats'];
+        if (adaptive is! List) return [];
+        final audios = adaptive
+            .whereType<Map<String, dynamic>>()
+            .where((m) =>
+                (m['url']?.toString() ?? '').startsWith('http') &&
+                (m['type']?.toString() ?? '').toLowerCase().startsWith('audio/'))
+            .toList();
+        if (audios.isEmpty) return [];
+        return audios.take(2).map((m) {
+          final rawUrl = m['url'].toString();
+          return _OnlineStreamCandidate(
+            url: rawUrl,
+            headers: const {},
+            sourceLabel: 'invidious',
+          );
+        }).toList();
+      } catch (_) {
+        return [];
+      } finally {
+        client?.close(force: true);
+      }
+    }
+
+    final results = await Future.wait([
+      for (final h in pipedHosts) queryPiped(h),
+      for (final h in invidiousHosts) queryInvidious(h),
+    ]);
+
+    final combined = <_OnlineStreamCandidate>[];
+    for (final list in results) {
+      combined.addAll(list);
+    }
+    if (combined.isEmpty) {
+      diag.add('mirrors:0');
+    }
+    return combined;
+  }
+
+  Future<String?> _downloadExplodeStreamToCache(String videoId, yt.StreamInfo streamInfo) async {
+    if (_cacheDir.isEmpty) return null;
+    final container = streamInfo.container.name.toLowerCase();
+    final ext = container == 'mp4' ? 'm4a' : (container == 'webm' ? 'webm' : 'mp4');
+    final finalPath = '$_cacheDir/yt_audio_$videoId.$ext';
+    final existing = File(finalPath);
+    if (await existing.exists() && await existing.length() > 4096) {
+      return finalPath;
+    }
+
+    final partFile = File('$finalPath.part');
+    IOSink? sink;
+    try {
+      sink = partFile.openWrite();
+      int totalBytes = 0;
+      final sw = Stopwatch()..start();
+      final stream = _ytClient.videos.streamsClient.get(streamInfo);
+      await for (final chunk in stream.timeout(const Duration(seconds: 10))) {
+        sink.add(chunk);
+        totalBytes += chunk.length;
+        if (sw.elapsed.inSeconds > 20 || totalBytes > 18 * 1024 * 1024) {
+          throw Exception('Tiempo límite de caché excedido');
+        }
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      if (totalBytes < 4096) {
+        if (await partFile.exists()) await partFile.delete();
+        return null;
+      }
+      if (await existing.exists()) await existing.delete();
+      await partFile.rename(finalPath);
+      unawaited(_pruneOnlineAudioCache());
+      return finalPath;
+    } catch (_) {
+      try {
+        await sink?.close();
+      } catch (_) {}
+      try {
+        if (await partFile.exists()) await partFile.delete();
+      } catch (_) {}
+      return null;
+    }
+  }
+
+  Future<List<_OnlineStreamCandidate>> _resolveOnlineCandidates(
+    MediaTrack track, {
+    List<yt.StreamInfo>? explodeFallbackOut,
+  }) async {
     final vid = track.onlineVideoId;
     if (vid == null || vid.isEmpty) return [];
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -1836,123 +2074,141 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
       return cached;
     }
 
-    final verified = <_OnlineStreamCandidate>[];
+    final diag = <String>[];
+    final visitorData = await _ensureVisitorData();
 
-    Future<bool> tryClientList(List<_OnlineStreamCandidate> list) async {
-      for (final cand in list) {
-        final ok = await _probeStreamCandidate(cand);
-        if (ok) {
-          verified.add(cand);
-          // Con 1 enlace verificado + posible respaldo HLS ya podemos reproducir al instante
-          if (verified.length >= 2) return true;
-        }
+    // Capa 1 + 2 en PARALELO: Innertube (ANDROID_VR, IOS, TV_EMBED) + Piped/Invidious
+    final parallelResults = await Future.wait([
+      _fetchInnertubeStreams(
+        videoId: vid,
+        clientName: 'ANDROID_VR',
+        clientVersion: '1.62.27',
+        clientIdHeader: '28',
+        userAgent:
+            'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+        extraClientFields: {
+          'androidSdkVersion': 32,
+          'osName': 'Android',
+          'osVersion': '12L',
+          'deviceMake': 'Oculus',
+          'deviceModel': 'Quest 3',
+        },
+        visitorData: visitorData,
+        diag: diag,
+      ),
+      _fetchInnertubeStreams(
+        videoId: vid,
+        clientName: 'IOS',
+        clientVersion: '20.10.4',
+        clientIdHeader: '5',
+        userAgent: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)',
+        extraClientFields: {
+          'deviceMake': 'Apple',
+          'deviceModel': 'iPhone16,2',
+          'osName': 'iPhone',
+          'osVersion': '18.3.2.22D82',
+        },
+        visitorData: visitorData,
+        diag: diag,
+      ),
+      _fetchInnertubeStreams(
+        videoId: vid,
+        clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+        clientVersion: '2.0',
+        clientIdHeader: '85',
+        userAgent:
+            'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+        extraClientFields: const {},
+        extraContext: {
+          'thirdParty': {'embedUrl': 'https://www.youtube.com/'},
+        },
+        visitorData: visitorData,
+        diag: diag,
+      ),
+      _fetchFromPublicMirrors(vid, diag),
+    ]);
+
+    final allFast = <_OnlineStreamCandidate>[];
+    for (final list in parallelResults) {
+      allFast.addAll(list);
+    }
+
+    // Sondear rapido los candidatos en paralelo para elegir el primero que responda 200/206
+    if (allFast.isNotEmpty) {
+      final probeTargets = allFast.take(6).toList();
+      final probeResults = await Future.wait(probeTargets.map(_probeStreamCandidate));
+      final verified = <_OnlineStreamCandidate>[];
+      for (int i = 0; i < probeTargets.length; i++) {
+        if (probeResults[i]) verified.add(probeTargets[i]);
       }
-      return verified.isNotEmpty;
-    }
-
-    // 1) Innertube ANDROID_VR (directo, sin cifrado JS ni PO token, rapidisimo)
-    final vrList = await _fetchInnertubeStreams(
-      videoId: vid,
-      clientName: 'ANDROID_VR',
-      clientVersion: '1.60.19',
-      clientIdHeader: '28',
-      userAgent:
-          'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1) gzip',
-      extraClientFields: {
-        'androidSdkVersion': 32,
-        'osName': 'Android',
-        'osVersion': '12',
-        'deviceMake': 'Oculus',
-        'deviceModel': 'Quest 3',
-      },
-    );
-    if (await tryClientList(vrList)) {
-      _streamCandidatesCache[vid] = verified;
-      _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
-      return verified;
-    }
-
-    // 2) Innertube IOS (audio directo + HLS .m3u8)
-    final iosList = await _fetchInnertubeStreams(
-      videoId: vid,
-      clientName: 'IOS',
-      clientVersion: '19.45.4',
-      clientIdHeader: '5',
-      userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-      extraClientFields: {
-        'deviceMake': 'Apple',
-        'deviceModel': 'iPhone16,2',
-        'osName': 'iPhone',
-        'osVersion': '18.1.0.22B83',
-      },
-    );
-    if (await tryClientList(iosList)) {
-      _streamCandidatesCache[vid] = verified;
-      _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
-      return verified;
-    }
-
-    // 3) Innertube ANDROID estandar
-    final androidList = await _fetchInnertubeStreams(
-      videoId: vid,
-      clientName: 'ANDROID',
-      clientVersion: '19.44.38',
-      clientIdHeader: '3',
-      userAgent: 'com.google.android.youtube/19.44.38 (Linux; U; Android 13) gzip',
-      extraClientFields: {
-        'androidSdkVersion': 33,
-        'osName': 'Android',
-        'osVersion': '13',
-      },
-    );
-    if (await tryClientList(androidList)) {
-      _streamCandidatesCache[vid] = verified;
-      _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
-      return verified;
-    }
-
-    // 4) Respaldo con youtube_explode_dart (con timeout estricto de 8s, sin Referer web)
-    try {
-      final manifest = await _ytClient.videos.streamsClient
-          .getManifest(vid)
-          .timeout(const Duration(seconds: 8));
-      final expCandidates = <_OnlineStreamCandidate>[];
-      final audioStreams = manifest.audioOnly.toList()
-        ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
-      final mp4s = audioStreams.where((s) => s.container.name.toLowerCase() == 'mp4').toList();
-      if (mp4s.isNotEmpty) {
-        expCandidates.add(_OnlineStreamCandidate(
-          url: mp4s.first.url.toString(),
-          headers: const {},
-          sourceLabel: 'explode-m4a',
-        ));
-      } else if (audioStreams.isNotEmpty) {
-        expCandidates.add(_OnlineStreamCandidate(
-          url: audioStreams.first.url.toString(),
-          headers: const {},
-          sourceLabel: 'explode-audio',
-        ));
-      }
-      if (manifest.muxed.isNotEmpty) {
-        final muxed = manifest.muxed.toList()..sort((a, b) => a.bitrate.compareTo(b.bitrate));
-        expCandidates.add(_OnlineStreamCandidate(
-          url: muxed.first.url.toString(),
-          headers: const {},
-          sourceLabel: 'explode-muxed',
-        ));
-      }
-      if (await tryClientList(expCandidates)) {
+      if (verified.isNotEmpty) {
         _streamCandidatesCache[vid] = verified;
         _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
         return verified;
       }
-    } catch (e) {
-      _lastOnlineDetail = 'explode: ${e.toString()}';
+      diag.add('probeFail:${probeTargets.length}');
     }
 
-    // Ultimo recurso: devolver los no sondeados si el probe fallo por red lenta pero si hubo URLs
-    final fallbackRaw = [...vrList, ...iosList, ...androidList].take(3).toList();
-    return fallbackRaw;
+    // Capa 3: youtube_explode_dart con 22s de margen (la primera vez descarga el descifrador JS)
+    try {
+      final manifest = await _ytClient.videos.streamsClient
+          .getManifest(vid)
+          .timeout(const Duration(seconds: 22));
+      final audioStreams = manifest.audioOnly.toList()
+        ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+
+      // Preferir MP4 de bitrate medio (arranca mas rapido en movil y pesa poco si toca cachear)
+      final mp4s = audioStreams
+          .where((s) => s.container.name.toLowerCase() == 'mp4')
+          .toList();
+      final chosenInfos = <yt.StreamInfo>[];
+      if (mp4s.isNotEmpty) {
+        chosenInfos.add(mp4s[mp4s.length ~/ 2]);
+        if (mp4s.length > 1) chosenInfos.add(mp4s.first);
+      }
+      if (audioStreams.isNotEmpty) {
+        final alt = audioStreams.firstWhere(
+          (s) => !chosenInfos.contains(s),
+          orElse: () => audioStreams.first,
+        );
+        if (!chosenInfos.contains(alt)) chosenInfos.add(alt);
+      }
+      if (manifest.muxed.isNotEmpty) {
+        final muxed = manifest.muxed.toList()
+          ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+        chosenInfos.add(muxed.first);
+      }
+
+      if (explodeFallbackOut != null) {
+        explodeFallbackOut.addAll(chosenInfos);
+      }
+
+      final expCandidates = chosenInfos
+          .map((s) => _OnlineStreamCandidate(
+                url: s.url.toString(),
+                headers: const {},
+                sourceLabel: 'explode',
+              ))
+          .toList();
+      if (expCandidates.isNotEmpty) {
+        _streamCandidatesCache[vid] = expCandidates;
+        _streamUrlExpMs[vid] = now + (45 * 60 * 1000);
+        return expCandidates;
+      }
+    } catch (e) {
+      final msg = e.toString().replaceAll(RegExp(r'\s+'), ' ');
+      diag.add('exp:${msg.length > 26 ? msg.substring(0, 26) : msg}');
+    }
+
+    if (diag.isNotEmpty) {
+      _lastOnlineDetail = diag.join(' | ');
+    }
+
+    // Ultimo intento con los enlaces sin sondear si hubo alguno
+    if (allFast.isNotEmpty) {
+      return allFast.take(3).toList();
+    }
+    return [];
   }
 
   Future<void> _downloadRemoteThumb(MediaTrack track) async {
@@ -2444,30 +2700,70 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     }).toList();
 
     try {
+      String? cachedLocalFile;
       List<_OnlineStreamCandidate>? onlineStreams;
+      final explodeInfos = <yt.StreamInfo>[];
+
       if (track.isOnline) {
-        onlineStreams = await _resolveOnlineCandidates(track)
-            .timeout(const Duration(seconds: 22), onTimeout: () => <_OnlineStreamCandidate>[]);
-        if (reqToken != _playRequestToken) return;
-        if (onlineStreams.isEmpty) {
-          throw Exception(_lastOnlineDetail ?? 'YouTube no entregó enlace de audio');
+        final vid = track.onlineVideoId ?? '';
+        cachedLocalFile = _findCachedOnlineAudioFile(vid);
+        if (cachedLocalFile == null) {
+          onlineStreams = await _resolveOnlineCandidates(
+            track,
+            explodeFallbackOut: explodeInfos,
+          ).timeout(const Duration(seconds: 32), onTimeout: () => <_OnlineStreamCandidate>[]);
+          if (reqToken != _playRequestToken) return;
+          if (onlineStreams.isEmpty) {
+            throw Exception(_lastOnlineDetail ?? 'Sin enlace de audio disponible');
+          }
         }
       }
 
-      await _audioHandler.playMediaTrack(
-        path: track.path,
-        onlineStreams: onlineStreams,
-        title: track.title,
-        artist: track.artist,
-        album: track.folder,
-        artUri: art,
-        queueItems: mediaQueue,
-        queueIndex: curIdx,
-        volume: _effectivePlayerGain,
-        speed: _speed,
-        repeatOne: _repeat,
-        useCrossfade: useCrossfade,
-      );
+      try {
+        await _audioHandler.playMediaTrack(
+          path: track.path,
+          localFilePath: cachedLocalFile,
+          onlineStreams: cachedLocalFile == null ? onlineStreams : null,
+          title: track.title,
+          artist: track.artist,
+          album: track.folder,
+          artUri: art,
+          queueItems: mediaQueue,
+          queueIndex: curIdx,
+          volume: _effectivePlayerGain,
+          speed: _speed,
+          repeatOne: _repeat,
+          useCrossfade: useCrossfade,
+        );
+      } catch (directErr) {
+        // Respaldo: si el stream directo dio 403/error y tenemos StreamInfo de explode, bajar audio compacto
+        if (track.isOnline && cachedLocalFile == null && explodeInfos.isNotEmpty) {
+          if (reqToken != _playRequestToken) return;
+          final vid = track.onlineVideoId ?? '';
+          final downloaded = await _downloadExplodeStreamToCache(vid, explodeInfos.first);
+          if (reqToken != _playRequestToken) return;
+          if (downloaded != null) {
+            await _audioHandler.playMediaTrack(
+              path: track.path,
+              localFilePath: downloaded,
+              title: track.title,
+              artist: track.artist,
+              album: track.folder,
+              artUri: art,
+              queueItems: mediaQueue,
+              queueIndex: curIdx,
+              volume: _effectivePlayerGain,
+              speed: _speed,
+              repeatOne: _repeat,
+              useCrossfade: useCrossfade,
+            );
+          } else {
+            rethrow;
+          }
+        } else {
+          rethrow;
+        }
+      }
 
       if (mounted && reqToken == _playRequestToken) {
         setState(() {
@@ -2555,6 +2851,9 @@ class _RelaxHomeScreenState extends State<RelaxHomeScreen>
     } else {
       if (_audioPlayer.playing) {
         await _audioHandler.pause();
+      } else if (_audioPlayer.processingState == ProcessingState.idle ||
+          _audioPlayer.duration == null) {
+        await _playTrack(_currentTrack!, _activeAudioQueue, openSheet: true);
       } else {
         await _audioHandler.play();
       }
